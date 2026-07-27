@@ -45,7 +45,6 @@ struct ModelWeights {
 };
 
 struct KVCache {
-    // Per-layer storage: [max_seq_len, num_kv_heads * head_dim]
     std::vector<std::vector<float>> k_cache;
     std::vector<std::vector<float>> v_cache;
     int seq_len = 0;
@@ -58,24 +57,30 @@ struct KVCache {
 
 class Qwen2Model {
 public:
-    bool load(const std::string& model_dir);
+    bool load(const std::string& model_dir, int max_batch_size = 1);
 
-    // Forward pass with KV-cache
-    // First call (cache empty): prefill — processes all tokens, populates cache
-    // Subsequent calls: decode — processes new tokens, appends to cache
-    // Returns logits for the LAST token
+    // Single sequence (convenience wrapper, uses batch slot 0)
     void forward(const std::vector<int>& tokens, float* logits);
 
+    // Batched: processes multiple sequences simultaneously
+    // batch_tokens[b] = new tokens for sequence b
+    // logits output: [batch_size, vocab_size]
+    void forward_batch(const std::vector<std::vector<int>>& batch_tokens, float* logits);
+
     void reset();
+    void reset(int batch_idx);
+    int max_batch_size() const;
     const ModelConfig& config() const;
 
 private:
     ModelConfig config_;
     ModelWeights weights_;
     SafetensorsFile safetensors_;
-    KVCache kv_cache_;
 
-    // Activation buffers (sized for num_new tokens)
+    std::vector<KVCache> kv_caches_;
+    int max_batch_size_ = 1;
+
+    // Activation buffers (sized for batch_size * max_len)
     std::vector<float> hidden_;
     std::vector<float> residual_;
     std::vector<float> norm_out_;
@@ -89,6 +94,6 @@ private:
 
     std::vector<Tensor> stored_tensors_;
 
-    void allocate_buffers(int num_new, int total_len);
+    void allocate_buffers(int batch_size, int max_len, int max_total_len);
     void load_weights();
 };
