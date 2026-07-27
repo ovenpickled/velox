@@ -8,6 +8,28 @@
 
 using json = nlohmann::json;
 
+// --- KVCache ---
+
+void KVCache::init(int num_layers, int num_kv_heads, int head_dim, int max_seq) {
+    this->max_seq_len = max_seq;
+    this->kv_dim = num_kv_heads * head_dim;
+    seq_len = 0;
+
+    size_t layer_size = static_cast<size_t>(max_seq) * kv_dim;
+    k_cache.resize(num_layers);
+    v_cache.resize(num_layers);
+    for (int i = 0; i < num_layers; i++) {
+        k_cache[i].resize(layer_size, 0.0f);
+        v_cache[i].resize(layer_size, 0.0f);
+    }
+}
+
+void KVCache::reset() {
+    seq_len = 0;
+}
+
+// --- ModelConfig ---
+
 ModelConfig ModelConfig::from_json(const std::string& config_json_path) {
     ModelConfig config;
     std::ifstream f(config_json_path);
@@ -31,6 +53,8 @@ ModelConfig ModelConfig::from_json(const std::string& config_json_path) {
     return config;
 }
 
+// --- Qwen2Model ---
+
 const ModelConfig& Qwen2Model::config() const {
     return config_;
 }
@@ -44,8 +68,16 @@ bool Qwen2Model::load(const std::string& model_dir) {
     }
     
     load_weights();
-    allocate_buffers(1);
+
+    int cache_max = std::min(config_.max_position_embeddings, 4096);
+    kv_cache_.init(config_.num_hidden_layers, config_.num_key_value_heads, config_.head_dim, cache_max);
+
+    allocate_buffers(1, 1);
     return true;
+}
+
+void Qwen2Model::reset() {
+    kv_cache_.reset();
 }
 
 void Qwen2Model::load_weights() {
@@ -90,119 +122,145 @@ void Qwen2Model::load_weights() {
     }
 }
 
-void Qwen2Model::allocate_buffers(int seq_len) {
+void Qwen2Model::allocate_buffers(int num_new, int total_len) {
     int hidden_size = config_.hidden_size;
     int num_heads = config_.num_attention_heads;
     int num_kv_heads = config_.num_key_value_heads;
     int head_dim = config_.head_dim;
     int intermediate_size = config_.intermediate_size;
 
-    hidden_.resize(seq_len * hidden_size);
-    residual_.resize(seq_len * hidden_size);
-    norm_out_.resize(seq_len * hidden_size);
-    q_buf_.resize(seq_len * num_heads * head_dim);
-    k_buf_.resize(seq_len * num_kv_heads * head_dim);
-    v_buf_.resize(seq_len * num_kv_heads * head_dim);
-    attn_out_.resize(seq_len * num_heads * head_dim);
-    attn_scores_.resize(num_heads * seq_len * seq_len);
-    ffn_gate_.resize(seq_len * intermediate_size);
-    ffn_up_.resize(seq_len * intermediate_size);
-    ffn_down_.resize(seq_len * hidden_size);
+    hidden_.resize(num_new * hidden_size);
+    residual_.resize(num_new * hidden_size);
+    norm_out_.resize(std::max(num_new * hidden_size, hidden_size));
+    q_buf_.resize(num_new * num_heads * head_dim);
+    k_buf_.resize(num_new * num_kv_heads * head_dim);
+    v_buf_.resize(num_new * num_kv_heads * head_dim);
+    attn_out_.resize(num_new * num_heads * head_dim);
+    attn_scores_.resize(static_cast<size_t>(num_heads) * num_new * total_len);
+    ffn_gate_.resize(num_new * intermediate_size);
+    ffn_up_.resize(num_new * intermediate_size);
 }
 
 void Qwen2Model::forward(const std::vector<int>& tokens, float* logits) {
-    int seq_len = tokens.size();
-    allocate_buffers(seq_len);
+    int num_new = tokens.size();
+    int past_len = kv_cache_.seq_len;
+    int total_len = past_len + num_new;
+
+    allocate_buffers(num_new, total_len);
 
     int hidden_size = config_.hidden_size;
     int num_heads = config_.num_attention_heads;
     int num_kv_heads = config_.num_key_value_heads;
     int head_dim = config_.head_dim;
     int intermediate_size = config_.intermediate_size;
-    float rms_norm_eps = config_.rms_norm_eps;
-    float rope_theta = config_.rope_theta;
+    int kv_dim = num_kv_heads * head_dim;
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    int heads_per_group = num_heads / num_kv_heads;
 
-    for (int p = 0; p < seq_len; p++) {
+    // --- Embedding ---
+    for (int p = 0; p < num_new; p++) {
         ops::embedding_lookup(hidden_.data() + p * hidden_size, weights_.embed_tokens, tokens[p], hidden_size);
     }
 
+    // --- Transformer Layers ---
     for (int layer = 0; layer < config_.num_hidden_layers; layer++) {
         LayerWeights& lw = weights_.layers[layer];
-        
-        std::memcpy(residual_.data(), hidden_.data(), seq_len * hidden_size * sizeof(float));
-        
-        for (int p = 0; p < seq_len; p++) {
-            ops::rmsnorm(norm_out_.data() + p * hidden_size, hidden_.data() + p * hidden_size, lw.input_layernorm_w, hidden_size, rms_norm_eps);
+        float* k_cache = kv_cache_.k_cache[layer].data();
+        float* v_cache = kv_cache_.v_cache[layer].data();
+
+        // Residual
+        std::memcpy(residual_.data(), hidden_.data(), num_new * hidden_size * sizeof(float));
+
+        // Input LayerNorm
+        for (int p = 0; p < num_new; p++) {
+            ops::rmsnorm(norm_out_.data() + p * hidden_size,
+                        hidden_.data() + p * hidden_size,
+                        lw.input_layernorm_w, hidden_size, config_.rms_norm_eps);
         }
-        
-        ops::matmul(q_buf_.data(), norm_out_.data(), lw.q_proj_w, seq_len, num_heads * head_dim, hidden_size);
-        ops::matmul(k_buf_.data(), norm_out_.data(), lw.k_proj_w, seq_len, num_kv_heads * head_dim, hidden_size);
-        ops::matmul(v_buf_.data(), norm_out_.data(), lw.v_proj_w, seq_len, num_kv_heads * head_dim, hidden_size);
-        
-        for (int p = 0; p < seq_len; p++) {
+
+        // Q/K/V Projections
+        ops::matmul(q_buf_.data(), norm_out_.data(), lw.q_proj_w, num_new, num_heads * head_dim, hidden_size);
+        ops::matmul(k_buf_.data(), norm_out_.data(), lw.k_proj_w, num_new, kv_dim, hidden_size);
+        ops::matmul(v_buf_.data(), norm_out_.data(), lw.v_proj_w, num_new, kv_dim, hidden_size);
+
+        for (int p = 0; p < num_new; p++) {
             ops::add_bias(q_buf_.data() + p * num_heads * head_dim, lw.q_proj_b, num_heads * head_dim);
-            ops::add_bias(k_buf_.data() + p * num_kv_heads * head_dim, lw.k_proj_b, num_kv_heads * head_dim);
-            ops::add_bias(v_buf_.data() + p * num_kv_heads * head_dim, lw.v_proj_b, num_kv_heads * head_dim);
+            ops::add_bias(k_buf_.data() + p * kv_dim, lw.k_proj_b, kv_dim);
+            ops::add_bias(v_buf_.data() + p * kv_dim, lw.v_proj_b, kv_dim);
         }
-        
-        for (int p = 0; p < seq_len; p++) {
-            ops::rope(q_buf_.data() + p * num_heads * head_dim, k_buf_.data() + p * num_kv_heads * head_dim, head_dim, num_heads, num_kv_heads, p, rope_theta);
+
+        // RoPE (positions offset by past_len)
+        for (int p = 0; p < num_new; p++) {
+            ops::rope(q_buf_.data() + p * num_heads * head_dim,
+                     k_buf_.data() + p * kv_dim,
+                     head_dim, num_heads, num_kv_heads, past_len + p, config_.rope_theta);
         }
-        
-        int heads_per_group = num_heads / num_kv_heads;
-        
+
+        // Append new K/V to cache
+        std::memcpy(k_cache + past_len * kv_dim, k_buf_.data(), num_new * kv_dim * sizeof(float));
+        std::memcpy(v_cache + past_len * kv_dim, v_buf_.data(), num_new * kv_dim * sizeof(float));
+
+        // Attention: Q[num_new] × K_cache[total_len]
         for (int h = 0; h < num_heads; h++) {
             int kv_h = h / heads_per_group;
-            
-            for (int query_pos = 0; query_pos < seq_len; query_pos++) {
-                for (int key_pos = 0; key_pos < seq_len; key_pos++) {
-                    if (key_pos > query_pos) {
-                        attn_scores_[h * seq_len * seq_len + query_pos * seq_len + key_pos] = -INFINITY;
+
+            for (int qp = 0; qp < num_new; qp++) {
+                int actual_qpos = past_len + qp;
+                float* scores = attn_scores_.data() + (h * num_new + qp) * total_len;
+
+                // Compute attention scores
+                for (int kp = 0; kp < total_len; kp++) {
+                    if (kp > actual_qpos) {
+                        scores[kp] = -INFINITY;
                     } else {
-                        float score = 0;
+                        float dot = 0;
                         for (int d = 0; d < head_dim; d++) {
-                            float q = q_buf_[query_pos * num_heads * head_dim + h * head_dim + d];
-                            float k = k_buf_[key_pos * num_kv_heads * head_dim + kv_h * head_dim + d];
-                            score += q * k;
+                            dot += q_buf_[qp * num_heads * head_dim + h * head_dim + d]
+                                 * k_cache[kp * kv_dim + kv_h * head_dim + d];
                         }
-                        attn_scores_[h * seq_len * seq_len + query_pos * seq_len + key_pos] = score / std::sqrt(static_cast<float>(head_dim));
+                        scores[kp] = dot * scale;
                     }
                 }
-                ops::softmax(attn_scores_.data() + h * seq_len * seq_len + query_pos * seq_len, seq_len);
-            }
-            
-            for (int query_pos = 0; query_pos < seq_len; query_pos++) {
+                ops::softmax(scores, total_len);
+
+                // Weighted sum of V
                 for (int d = 0; d < head_dim; d++) {
                     float val = 0;
-                    for (int key_pos = 0; key_pos < seq_len; key_pos++) {
-                        float v = v_buf_[key_pos * num_kv_heads * head_dim + kv_h * head_dim + d];
-                        val += attn_scores_[h * seq_len * seq_len + query_pos * seq_len + key_pos] * v;
+                    for (int kp = 0; kp < total_len; kp++) {
+                        val += scores[kp] * v_cache[kp * kv_dim + kv_h * head_dim + d];
                     }
-                    attn_out_[query_pos * num_heads * head_dim + h * head_dim + d] = val;
+                    attn_out_[qp * num_heads * head_dim + h * head_dim + d] = val;
                 }
             }
         }
-        
-        ops::matmul(hidden_.data(), attn_out_.data(), lw.o_proj_w, seq_len, hidden_size, num_heads * head_dim);
-        ops::add(hidden_.data(), hidden_.data(), residual_.data(), seq_len * hidden_size);
-        
-        std::memcpy(residual_.data(), hidden_.data(), seq_len * hidden_size * sizeof(float));
-        
-        for (int p = 0; p < seq_len; p++) {
-            ops::rmsnorm(norm_out_.data() + p * hidden_size, hidden_.data() + p * hidden_size, lw.post_attn_layernorm_w, hidden_size, rms_norm_eps);
+
+        // Output Projection + Residual
+        ops::matmul(hidden_.data(), attn_out_.data(), lw.o_proj_w, num_new, hidden_size, num_heads * head_dim);
+        ops::add(hidden_.data(), hidden_.data(), residual_.data(), num_new * hidden_size);
+
+        // FFN
+        std::memcpy(residual_.data(), hidden_.data(), num_new * hidden_size * sizeof(float));
+
+        for (int p = 0; p < num_new; p++) {
+            ops::rmsnorm(norm_out_.data() + p * hidden_size,
+                        hidden_.data() + p * hidden_size,
+                        lw.post_attn_layernorm_w, hidden_size, config_.rms_norm_eps);
         }
-        
-        ops::matmul(ffn_gate_.data(), norm_out_.data(), lw.gate_proj_w, seq_len, intermediate_size, hidden_size);
-        ops::matmul(ffn_up_.data(), norm_out_.data(), lw.up_proj_w, seq_len, intermediate_size, hidden_size);
-        
-        ops::silu(ffn_gate_.data(), seq_len * intermediate_size);
-        ops::multiply(ffn_gate_.data(), ffn_gate_.data(), ffn_up_.data(), seq_len * intermediate_size);
-        ops::matmul(hidden_.data(), ffn_gate_.data(), lw.down_proj_w, seq_len, hidden_size, intermediate_size);
-        
-        ops::add(hidden_.data(), hidden_.data(), residual_.data(), seq_len * hidden_size);
+
+        ops::matmul(ffn_gate_.data(), norm_out_.data(), lw.gate_proj_w, num_new, intermediate_size, hidden_size);
+        ops::matmul(ffn_up_.data(), norm_out_.data(), lw.up_proj_w, num_new, intermediate_size, hidden_size);
+
+        ops::silu(ffn_gate_.data(), num_new * intermediate_size);
+        ops::multiply(ffn_gate_.data(), ffn_gate_.data(), ffn_up_.data(), num_new * intermediate_size);
+        ops::matmul(hidden_.data(), ffn_gate_.data(), lw.down_proj_w, num_new, hidden_size, intermediate_size);
+
+        ops::add(hidden_.data(), hidden_.data(), residual_.data(), num_new * hidden_size);
     }
-    
-    int last = (seq_len - 1) * hidden_size;
-    ops::rmsnorm(norm_out_.data(), hidden_.data() + last, weights_.final_norm, hidden_size, rms_norm_eps);
+
+    // --- Final Norm + LM Head ---
+    int last = (num_new - 1) * hidden_size;
+    ops::rmsnorm(norm_out_.data(), hidden_.data() + last, weights_.final_norm, hidden_size, config_.rms_norm_eps);
     ops::matmul(logits, norm_out_.data(), weights_.lm_head, 1, config_.vocab_size, hidden_size);
+
+    kv_cache_.seq_len = total_len;
 }

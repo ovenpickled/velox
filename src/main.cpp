@@ -57,14 +57,13 @@ int main(int argc, char* argv[]) {
     std::cout << "]" << std::endl;
     std::cout << prompt << std::flush;
     
-    auto all_tokens = input_tokens;
     std::vector<float> logits(model.config().vocab_size);
     
     auto start_time = high_resolution_clock::now();
     
-    model.forward(all_tokens, logits.data());
+    model.forward(input_tokens, logits.data());
     int next_token = sampler.sample(logits.data(), model.config().vocab_size);
-    all_tokens.push_back(next_token);
+    int generated_count = 1;
     
     std::cout << tokenizer.decode(next_token) << std::flush;
     
@@ -73,9 +72,9 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < max_tokens; i++) {
         if (next_token == tokenizer.eos_token_id()) break;
         
-        model.forward(all_tokens, logits.data());
+        model.forward({next_token}, logits.data());
         next_token = sampler.sample(logits.data(), model.config().vocab_size);
-        all_tokens.push_back(next_token);
+        generated_count++;
         
         std::cout << tokenizer.decode(next_token) << std::flush;
     }
@@ -83,19 +82,18 @@ int main(int argc, char* argv[]) {
     auto end_time = high_resolution_clock::now();
     
     std::cout << std::endl;
-    int generated_tokens = all_tokens.size() - input_tokens.size();
     auto prefill_duration = duration_cast<milliseconds>(first_token_time - start_time).count();
     auto total_duration = duration_cast<milliseconds>(end_time - start_time).count();
     auto decode_duration = total_duration - prefill_duration;
     
     std::cout << "\nGeneration stats:" << std::endl;
-    std::cout << "- Total tokens generated: " << generated_tokens << std::endl;
+    std::cout << "- Total tokens generated: " << generated_count << std::endl;
     std::cout << "- Time to first token: " << prefill_duration << " ms" << std::endl;
     std::cout << "- Total time: " << total_duration << " ms" << std::endl;
     
-    if (generated_tokens > 1 && decode_duration > 0) {
-        float tokens_per_sec = (generated_tokens - 1) / (decode_duration / 1000.0f);
-        std::cout << "- Speed: " << tokens_per_sec << " tokens/sec" << std::endl;
+    if (generated_count > 1 && decode_duration > 0) {
+        float tokens_per_sec = (generated_count - 1) / (decode_duration / 1000.0f);
+        std::cout << "- Decode speed: " << tokens_per_sec << " tokens/sec" << std::endl;
     }
     
     return 0;

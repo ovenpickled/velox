@@ -1,4 +1,3 @@
-// model.hpp
 #pragma once
 #include <string>
 #include <vector>
@@ -41,41 +40,55 @@ struct LayerWeights {
 struct ModelWeights {
     const float* embed_tokens = nullptr;
     const float* final_norm = nullptr;
-    const float* lm_head = nullptr;  // may point to embed_tokens if tied
+    const float* lm_head = nullptr;
     std::vector<LayerWeights> layers;
+};
+
+struct KVCache {
+    // Per-layer storage: [max_seq_len, num_kv_heads * head_dim]
+    std::vector<std::vector<float>> k_cache;
+    std::vector<std::vector<float>> v_cache;
+    int seq_len = 0;
+    int max_seq_len = 0;
+    int kv_dim = 0;
+
+    void init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len);
+    void reset();
 };
 
 class Qwen2Model {
 public:
     bool load(const std::string& model_dir);
 
-    // Forward pass: takes a sequence of token IDs, returns logits for the LAST token
-    // logits is a float array of size vocab_size
+    // Forward pass with KV-cache
+    // First call (cache empty): prefill — processes all tokens, populates cache
+    // Subsequent calls: decode — processes new tokens, appends to cache
+    // Returns logits for the LAST token
     void forward(const std::vector<int>& tokens, float* logits);
 
+    void reset();
     const ModelConfig& config() const;
 
 private:
     ModelConfig config_;
     ModelWeights weights_;
     SafetensorsFile safetensors_;
+    KVCache kv_cache_;
 
-    // Pre-allocated activation buffers
-    std::vector<float> hidden_;       // [seq_len * hidden_size]
-    std::vector<float> residual_;     // [seq_len * hidden_size]
-    std::vector<float> norm_out_;     // [seq_len * hidden_size]
-    std::vector<float> q_buf_;        // [seq_len * num_heads * head_dim]
-    std::vector<float> k_buf_;        // [seq_len * num_kv_heads * head_dim]
-    std::vector<float> v_buf_;        // [seq_len * num_kv_heads * head_dim]
-    std::vector<float> attn_out_;     // [seq_len * num_heads * head_dim]
-    std::vector<float> attn_scores_;  // [num_heads * seq_len * seq_len]
-    std::vector<float> ffn_gate_;     // [seq_len * intermediate_size]
-    std::vector<float> ffn_up_;       // [seq_len * intermediate_size]
-    std::vector<float> ffn_down_;     // [seq_len * hidden_size]
+    // Activation buffers (sized for num_new tokens)
+    std::vector<float> hidden_;
+    std::vector<float> residual_;
+    std::vector<float> norm_out_;
+    std::vector<float> q_buf_;
+    std::vector<float> k_buf_;
+    std::vector<float> v_buf_;
+    std::vector<float> attn_out_;
+    std::vector<float> attn_scores_;
+    std::vector<float> ffn_gate_;
+    std::vector<float> ffn_up_;
 
-    // Stored tensors from safetensors (keeps mmap and converted data alive)
     std::vector<Tensor> stored_tensors_;
 
-    void allocate_buffers(int seq_len);
+    void allocate_buffers(int num_new, int total_len);
     void load_weights();
 };
