@@ -11,23 +11,7 @@ using json = nlohmann::json;
 
 // --- KVCache ---
 
-void KVCache::init(int num_layers, int num_kv_heads, int head_dim, int max_seq) {
-    this->max_seq_len = max_seq;
-    this->kv_dim = num_kv_heads * head_dim;
-    seq_len = 0;
-
-    size_t layer_size = static_cast<size_t>(max_seq) * kv_dim;
-    k_cache.resize(num_layers);
-    v_cache.resize(num_layers);
-    for (int i = 0; i < num_layers; i++) {
-        k_cache[i].resize(layer_size, 0.0f);
-        v_cache[i].resize(layer_size, 0.0f);
-    }
-}
-
-void KVCache::reset() {
-    seq_len = 0;
-}
+// KVCache definitions are now inline in model.hpp
 
 // --- ModelConfig ---
 
@@ -73,7 +57,7 @@ bool Qwen2Model::load(const std::string& model_dir, int max_batch_size) {
     int cache_max = std::min(config_.max_position_embeddings, 4096);
     kv_caches_.resize(max_batch_size);
     for (int b = 0; b < max_batch_size; b++) {
-        kv_caches_[b].init(config_.num_hidden_layers, config_.num_key_value_heads, config_.head_dim, cache_max);
+        kv_caches_[b].init(config_.num_hidden_layers, config_.num_key_value_heads, config_.head_dim, 128);
     }
 
     allocate_buffers(1, 1, 1);
@@ -178,8 +162,14 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
     for (int b = 0; b < batch_size; b++) {
         actual_lens[b] = batch_tokens[b].size();
         past_lens[b] = kv_caches_[b].seq_len;
+        
+        int needed_len = past_lens[b] + actual_lens[b];
+        int cache_max = std::min(config_.max_position_embeddings, 4096);
+        if (needed_len > cache_max) needed_len = cache_max;
+        kv_caches_[b].ensure_capacity(needed_len);
+        
         max_len = std::max(max_len, actual_lens[b]);
-        max_total_len = std::max(max_total_len, past_lens[b] + actual_lens[b]);
+        max_total_len = std::max(max_total_len, needed_len);
     }
 
     int total_positions = batch_size * max_len;
@@ -256,7 +246,7 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         }
 
         // Attention (per-sequence — different cache lengths)
-        #pragma omp parallel for collapse(2)
+        #pragma omp parallel for collapse(2) if(static_cast<size_t>(batch_size) * num_heads >= 16)
         for (int b = 0; b < batch_size; b++) {
             for (int h = 0; h < num_heads; h++) {
                 int al = actual_lens[b];

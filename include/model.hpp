@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <iostream>
 #include "tensor.hpp"
 #include "safetensors.hpp"
 
@@ -49,11 +50,38 @@ struct KVCache {
     std::vector<std::vector<float>> k_cache;
     std::vector<std::vector<float>> v_cache;
     int seq_len = 0;
-    int max_seq_len = 0;
+    int capacity = 0;
     int kv_dim = 0;
 
-    void init(int num_layers, int num_kv_heads, int head_dim, int max_seq_len);
-    void reset();
+    void init(int num_layers, int num_kv_heads, int head_dim, int initial_capacity = 256) {
+        kv_dim = num_kv_heads * head_dim;
+        capacity = initial_capacity;
+        seq_len = 0;
+        size_t layer_size = static_cast<size_t>(capacity) * kv_dim;
+        k_cache.resize(num_layers);
+        v_cache.resize(num_layers);
+        for (int i = 0; i < num_layers; i++) {
+            k_cache[i].resize(layer_size, 0.0f);
+            v_cache[i].resize(layer_size, 0.0f);
+        }
+    }
+
+    void ensure_capacity(int needed) {
+        if (needed <= capacity) return;
+        int new_capacity = capacity;
+        while (new_capacity < needed) new_capacity *= 2;
+#ifdef DEBUG_KV_CACHE
+        std::cout << "[DEBUG] KV Cache resizing from " << capacity << " to " << new_capacity << " (needed: " << needed << ")" << std::endl;
+#endif
+        size_t layer_size = static_cast<size_t>(new_capacity) * kv_dim;
+        for (auto& layer : k_cache) layer.resize(layer_size, 0.0f);
+        for (auto& layer : v_cache) layer.resize(layer_size, 0.0f);
+        capacity = new_capacity;
+    }
+
+    void reset() {
+        seq_len = 0;
+    }
 };
 
 class Qwen2Model {

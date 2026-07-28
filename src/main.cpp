@@ -3,6 +3,7 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 #include "model.hpp"
 #include "tokenizer.hpp"
 #include "sampler.hpp"
@@ -83,7 +84,7 @@ int main(int argc, char* argv[]) {
         std::cout << "|------------|-----------|-----------------------|------------------------------|" << std::endl;
 
         std::vector<int> batches = {1, 2, 4, 8};
-        int num_reps = 3;
+        int num_reps = 15;
         for (int bs : batches) {
             // Warmup this specific batch size
             std::vector<std::vector<int>> warmup_prompts(bs, input_tokens);
@@ -149,24 +150,27 @@ int main(int argc, char* argv[]) {
                 model.reset();
             }
 
-            auto calc_stats = [](const std::vector<float>& vals, float& mean, float& stdev) {
+            auto calc_stats = [](std::vector<float>& vals, float& median, float& stdev) {
                 float sum = 0;
                 for (float v : vals) sum += v;
-                mean = sum / vals.size();
+                float mean = sum / vals.size();
                 float sq_sum = 0;
                 for (float v : vals) sq_sum += (v - mean) * (v - mean);
                 stdev = std::sqrt(sq_sum / vals.size());
+                
+                std::sort(vals.begin(), vals.end());
+                median = vals[vals.size() / 2];
             };
 
-            float mean_ttft, std_ttft, mean_seq, std_seq, mean_agg, std_agg;
-            calc_stats(ttfts, mean_ttft, std_ttft);
-            calc_stats(seq_tpss, mean_seq, std_seq);
-            calc_stats(agg_tpss, mean_agg, std_agg);
+            float med_ttft, std_ttft, med_seq, std_seq, med_agg, std_agg;
+            calc_stats(ttfts, med_ttft, std_ttft);
+            calc_stats(seq_tpss, med_seq, std_seq);
+            calc_stats(agg_tpss, med_agg, std_agg);
 
             char ttft_str[32], seq_str[32], agg_str[32];
-            snprintf(ttft_str, sizeof(ttft_str), "%.0f±%.0f", mean_ttft, std_ttft);
-            snprintf(seq_str, sizeof(seq_str), "%.2f±%.2f", mean_seq, std_seq);
-            snprintf(agg_str, sizeof(agg_str), "%.2f±%.2f", mean_agg, std_agg);
+            snprintf(ttft_str, sizeof(ttft_str), "%.0f±%.0f", med_ttft, std_ttft);
+            snprintf(seq_str, sizeof(seq_str), "%.2f±%.2f", med_seq, std_seq);
+            snprintf(agg_str, sizeof(agg_str), "%.2f±%.2f", med_agg, std_agg);
 
             printf("| %-10d | %-9s | %-21s | %-28s |\n", bs, ttft_str, seq_str, agg_str);
         }

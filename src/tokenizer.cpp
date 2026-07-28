@@ -3,6 +3,7 @@
 #include <iostream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -133,24 +134,61 @@ bool Tokenizer::load(const std::string& tokenizer_json_path) {
 
 // --- Pre-tokenization ---
 
-std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const {
-    std::vector<std::string> chunks;
-    std::string current;
+enum class CharClass { Letter, Digit, Whitespace, Other };
 
-    for (size_t i = 0; i < text.size(); i++) {
-        char c = text[i];
-        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
-            if (!current.empty()) {
-                chunks.push_back(current);
-                current.clear();
+static CharClass classify(unsigned char c) {
+    if (std::isspace(c)) return CharClass::Whitespace;
+    if (std::isalpha(c)) return CharClass::Letter;
+    if (std::isdigit(c)) return CharClass::Digit;
+    return CharClass::Other;
+}
+
+std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const {
+    static const std::vector<std::string> contractions = {
+        "'s", "'t", "'re", "'ve", "'m", "'ll", "'d", "'S", "'T", "'RE", "'VE", "'M", "'LL", "'D"
+    };
+
+    std::vector<std::string> chunks;
+    size_t i = 0, n = text.size();
+
+    while (i < n) {
+        bool matched_contraction = false;
+        for (const auto& c : contractions) {
+            if (text.compare(i, c.size(), c) == 0) {
+                chunks.push_back(c);
+                i += c.size();
+                matched_contraction = true;
+                break;
             }
-            current += c;
-        } else {
-            current += c;
         }
-    }
-    if (!current.empty()) {
-        chunks.push_back(current);
+        if (matched_contraction) continue;
+
+        // Check for exactly one leading space before a non-whitespace run
+        bool has_leading_space = false;
+        if (i + 1 < n && text[i] == ' ' && classify(text[i + 1]) != CharClass::Whitespace) {
+            has_leading_space = true;
+        }
+
+        if (has_leading_space || classify(text[i]) != CharClass::Whitespace) {
+            // Letters / digits / punctuation runs (optionally with exactly one leading space)
+            size_t start = i;
+            if (has_leading_space) i++;
+            CharClass cls = classify(text[i]);
+            while (i < n && classify(text[i]) == cls) i++;
+            chunks.push_back(text.substr(start, i - start));
+        } else {
+            // Whitespace run (multiple spaces, or spaces at the end of the string)
+            size_t start = i;
+            while (i < n && classify(text[i]) == CharClass::Whitespace) {
+                // If we're at a space, and the next char is non-whitespace, stop BEFORE this space
+                // so the next iteration can absorb it as a leading space.
+                if (text[i] == ' ' && i + 1 < n && classify(text[i + 1]) != CharClass::Whitespace) {
+                    break;
+                }
+                i++;
+            }
+            chunks.push_back(text.substr(start, i - start));
+        }
     }
     return chunks;
 }
