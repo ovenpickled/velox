@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <cmath>
 #include "model.hpp"
 #include "tokenizer.hpp"
 #include "sampler.hpp"
@@ -82,58 +83,92 @@ int main(int argc, char* argv[]) {
         std::cout << "|------------|-----------|-----------------------|------------------------------|" << std::endl;
 
         std::vector<int> batches = {1, 2, 4, 8};
+        int num_reps = 3;
         for (int bs : batches) {
-            std::vector<std::vector<int>> batch_prompts(bs, input_tokens);
-            std::vector<float> batch_logits(bs * vocab_size);
-            std::vector<int> next_tokens(bs);
-            std::vector<bool> done(bs, false);
-            int active_count = bs;
+            // Warmup this specific batch size
+            std::vector<std::vector<int>> warmup_prompts(bs, input_tokens);
+            std::vector<float> warmup_logits(bs * vocab_size);
+            model.forward_batch(warmup_prompts, warmup_logits.data());
+            model.forward_batch(std::vector<std::vector<int>>(bs, {0}), warmup_logits.data());
+            model.reset();
 
-            auto start_time = high_resolution_clock::now();
+            std::vector<float> ttfts, seq_tpss, agg_tpss;
+            for (int rep = 0; rep < num_reps; rep++) {
+                std::vector<std::vector<int>> batch_prompts(bs, input_tokens);
+                std::vector<float> batch_logits(bs * vocab_size);
+                std::vector<int> next_tokens(bs);
+                std::vector<bool> done(bs, false);
+                int active_count = bs;
 
-            model.forward_batch(batch_prompts, batch_logits.data());
-            for (int b = 0; b < bs; b++) {
-                next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
-            }
+                auto start_time = high_resolution_clock::now();
 
-            auto first_token_time = high_resolution_clock::now();
-
-            int total_generated = bs;
-            for (int step = 1; step < max_tokens && active_count > 0; step++) {
-                std::vector<std::vector<int>> decode_tokens(bs);
+                model.forward_batch(batch_prompts, batch_logits.data());
                 for (int b = 0; b < bs; b++) {
-                    decode_tokens[b] = {done[b] ? 0 : next_tokens[b]};
+                    next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
                 }
 
-                model.forward_batch(decode_tokens, batch_logits.data());
+                auto first_token_time = high_resolution_clock::now();
 
-                for (int b = 0; b < bs; b++) {
-                    if (done[b]) continue;
-                    next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
-                    total_generated++;
+                int total_generated = bs;
+                for (int step = 1; step < max_tokens && active_count > 0; step++) {
+                    std::vector<std::vector<int>> decode_tokens(bs);
+                    for (int b = 0; b < bs; b++) {
+                        decode_tokens[b] = {done[b] ? 0 : next_tokens[b]};
+                    }
 
-                    if (next_tokens[b] == tokenizer.eos_token_id()) {
-                        done[b] = true;
-                        active_count--;
+                    model.forward_batch(decode_tokens, batch_logits.data());
+
+                    for (int b = 0; b < bs; b++) {
+                        if (done[b]) continue;
+                        next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
+                        total_generated++;
+
+                        if (next_tokens[b] == tokenizer.eos_token_id()) {
+                            done[b] = true;
+                            active_count--;
+                        }
                     }
                 }
+
+                auto end_time = high_resolution_clock::now();
+
+                auto prefill_ms = duration_cast<milliseconds>(first_token_time - start_time).count();
+                auto total_ms = duration_cast<milliseconds>(end_time - start_time).count();
+                auto decode_ms = total_ms - prefill_ms;
+
+                float agg_tps = 0.0f;
+                float seq_tps = 0.0f;
+                if (total_generated > bs && decode_ms > 0) {
+                    agg_tps = (total_generated - bs) / (decode_ms / 1000.0f);
+                    seq_tps = agg_tps / bs;
+                }
+
+                ttfts.push_back(static_cast<float>(prefill_ms));
+                seq_tpss.push_back(seq_tps);
+                agg_tpss.push_back(agg_tps);
+                model.reset();
             }
 
-            auto end_time = high_resolution_clock::now();
+            auto calc_stats = [](const std::vector<float>& vals, float& mean, float& stdev) {
+                float sum = 0;
+                for (float v : vals) sum += v;
+                mean = sum / vals.size();
+                float sq_sum = 0;
+                for (float v : vals) sq_sum += (v - mean) * (v - mean);
+                stdev = std::sqrt(sq_sum / vals.size());
+            };
 
-            auto prefill_ms = duration_cast<milliseconds>(first_token_time - start_time).count();
-            auto total_ms = duration_cast<milliseconds>(end_time - start_time).count();
-            auto decode_ms = total_ms - prefill_ms;
+            float mean_ttft, std_ttft, mean_seq, std_seq, mean_agg, std_agg;
+            calc_stats(ttfts, mean_ttft, std_ttft);
+            calc_stats(seq_tpss, mean_seq, std_seq);
+            calc_stats(agg_tpss, mean_agg, std_agg);
 
-            float agg_tps = 0.0f;
-            float seq_tps = 0.0f;
-            if (total_generated > bs && decode_ms > 0) {
-                agg_tps = (total_generated - bs) / (decode_ms / 1000.0f);
-                seq_tps = agg_tps / bs;
-            }
+            char ttft_str[32], seq_str[32], agg_str[32];
+            snprintf(ttft_str, sizeof(ttft_str), "%.0f±%.0f", mean_ttft, std_ttft);
+            snprintf(seq_str, sizeof(seq_str), "%.2f±%.2f", mean_seq, std_seq);
+            snprintf(agg_str, sizeof(agg_str), "%.2f±%.2f", mean_agg, std_agg);
 
-            printf("| %-10d | %-9lld | %-21.2f | %-28.2f |\n", bs, prefill_ms, seq_tps, agg_tps);
-            model.reset();
+            printf("| %-10d | %-9s | %-21s | %-28s |\n", bs, ttft_str, seq_str, agg_str);
         }
 
     } else if (batch_size == 1) {

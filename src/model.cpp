@@ -153,7 +153,7 @@ void Qwen2Model::allocate_buffers(int batch_size, int max_len, int max_total_len
     k_buf_.resize(total_pos * num_kv_heads * head_dim);
     v_buf_.resize(total_pos * num_kv_heads * head_dim);
     attn_out_.resize(total_pos * num_heads * head_dim);
-    attn_scores_.resize(static_cast<size_t>(num_heads) * max_len * max_total_len);
+    attn_scores_.resize(static_cast<size_t>(batch_size) * num_heads * max_len * max_total_len);
     ffn_gate_.resize(total_pos * intermediate_size);
     ffn_up_.resize(total_pos * intermediate_size);
 }
@@ -212,6 +212,7 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         std::memcpy(residual_.data(), hidden_.data(), total_positions * hidden_size * sizeof(float));
 
         // Input LayerNorm (all positions including padding — zero input produces zero output)
+        #pragma omp parallel for
         for (int p = 0; p < total_positions; p++) {
             ops::rmsnorm(norm_out_.data() + p * hidden_size,
                         hidden_.data() + p * hidden_size,
@@ -224,6 +225,7 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         ops::matmul_w8a8(v_buf_.data(), norm_out_.data(), lw.v_proj, total_positions, kv_dim, hidden_size);
 
         // Bias (all positions)
+        #pragma omp parallel for
         for (int p = 0; p < total_positions; p++) {
             ops::add_bias(q_buf_.data() + p * q_dim, lw.q_proj_b.data(), q_dim);
             ops::add_bias(k_buf_.data() + p * kv_dim, lw.k_proj_b.data(), kv_dim);
@@ -254,20 +256,21 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         }
 
         // Attention (per-sequence — different cache lengths)
+        #pragma omp parallel for collapse(2)
         for (int b = 0; b < batch_size; b++) {
-            int al = actual_lens[b];
-            int pl = past_lens[b];
-            int tl = pl + al;
-            float* k_cache = kv_caches_[b].k_cache[layer].data();
-            float* v_cache = kv_caches_[b].v_cache[layer].data();
-
             for (int h = 0; h < num_heads; h++) {
+                int al = actual_lens[b];
+                int pl = past_lens[b];
+                int tl = pl + al;
+                float* k_cache = kv_caches_[b].k_cache[layer].data();
+                float* v_cache = kv_caches_[b].v_cache[layer].data();
                 int kv_h = h / heads_per_group;
 
                 for (int qp = 0; qp < al; qp++) {
                     int gp = b * max_len + qp;
                     int actual_qpos = pl + qp;
-                    float* scores = attn_scores_.data() + (h * al + qp) * tl;
+                    float* scores = attn_scores_.data() 
+                        + ((static_cast<size_t>(b) * num_heads + h) * max_len + qp) * max_total_len;
 
                     for (int kp = 0; kp < tl; kp++) {
                         if (kp > actual_qpos) {
@@ -301,6 +304,7 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         // FFN
         std::memcpy(residual_.data(), hidden_.data(), total_positions * hidden_size * sizeof(float));
 
+        #pragma omp parallel for
         for (int p = 0; p < total_positions; p++) {
             ops::rmsnorm(norm_out_.data() + p * hidden_size,
                         hidden_.data() + p * hidden_size,
