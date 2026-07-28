@@ -15,6 +15,7 @@ int main(int argc, char* argv[]) {
     int batch_size = 1;
     float temperature = 1.0f;
     bool greedy = true;
+    bool benchmark = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -24,6 +25,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--batch-size" && i+1 < argc) batch_size = std::stoi(argv[++i]);
         else if (arg == "--temperature" && i+1 < argc) { temperature = std::stof(argv[++i]); greedy = false; }
         else if (arg == "--greedy") greedy = true;
+        else if (arg == "--benchmark") benchmark = true;
     }
 
     if (model_dir.empty()) {
@@ -34,7 +36,8 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Loading model from " << model_dir << "..." << std::endl;
     Qwen2Model model;
-    if (!model.load(model_dir, batch_size)) {
+    int max_bs = benchmark ? std::max(batch_size, 8) : batch_size;
+    if (!model.load(model_dir, max_bs)) {
         std::cerr << "Failed to load model" << std::endl;
         return 1;
     }
@@ -61,7 +64,79 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "]" << std::endl;
 
-    if (batch_size == 1) {
+    if (benchmark) {
+        std::cout << "Running benchmark sweep (Prompt length: " << input_tokens.size() << ", Max decode: " << max_tokens << ")" << std::endl;
+        std::cout << "Warming up engine (batch 1)..." << std::endl;
+        
+        // Warmup
+        std::vector<float> warmup_logits(vocab_size);
+        model.forward(input_tokens, warmup_logits.data());
+        int warmup_token = sampler.sample(warmup_logits.data(), vocab_size);
+        for(int i=1; i<8; i++) {
+            model.forward({warmup_token}, warmup_logits.data());
+            warmup_token = sampler.sample(warmup_logits.data(), vocab_size);
+        }
+        model.reset();
+
+        std::cout << "\n| Batch Size | TTFT (ms) | Per-Seq Speed (tok/s) | Aggregate Throughput (tok/s) |" << std::endl;
+        std::cout << "|------------|-----------|-----------------------|------------------------------|" << std::endl;
+
+        std::vector<int> batches = {1, 2, 4, 8};
+        for (int bs : batches) {
+            std::vector<std::vector<int>> batch_prompts(bs, input_tokens);
+            std::vector<float> batch_logits(bs * vocab_size);
+            std::vector<int> next_tokens(bs);
+            std::vector<bool> done(bs, false);
+            int active_count = bs;
+
+            auto start_time = high_resolution_clock::now();
+
+            model.forward_batch(batch_prompts, batch_logits.data());
+            for (int b = 0; b < bs; b++) {
+                next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
+            }
+
+            auto first_token_time = high_resolution_clock::now();
+
+            int total_generated = bs;
+            for (int step = 1; step < max_tokens && active_count > 0; step++) {
+                std::vector<std::vector<int>> decode_tokens(bs);
+                for (int b = 0; b < bs; b++) {
+                    decode_tokens[b] = {done[b] ? 0 : next_tokens[b]};
+                }
+
+                model.forward_batch(decode_tokens, batch_logits.data());
+
+                for (int b = 0; b < bs; b++) {
+                    if (done[b]) continue;
+                    next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
+                    total_generated++;
+
+                    if (next_tokens[b] == tokenizer.eos_token_id()) {
+                        done[b] = true;
+                        active_count--;
+                    }
+                }
+            }
+
+            auto end_time = high_resolution_clock::now();
+
+            auto prefill_ms = duration_cast<milliseconds>(first_token_time - start_time).count();
+            auto total_ms = duration_cast<milliseconds>(end_time - start_time).count();
+            auto decode_ms = total_ms - prefill_ms;
+
+            float agg_tps = 0.0f;
+            float seq_tps = 0.0f;
+            if (total_generated > bs && decode_ms > 0) {
+                agg_tps = (total_generated - bs) / (decode_ms / 1000.0f);
+                seq_tps = agg_tps / bs;
+            }
+
+            printf("| %-10d | %-9lld | %-21.2f | %-28.2f |\n", bs, prefill_ms, seq_tps, agg_tps);
+            model.reset();
+        }
+
+    } else if (batch_size == 1) {
         // --- Single Sequence Mode ---
         std::cout << prompt << std::flush;
 
