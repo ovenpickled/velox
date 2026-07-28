@@ -21,26 +21,27 @@ struct ModelConfig {
 };
 
 struct LayerWeights {
-    const float* q_proj_w = nullptr;
-    const float* q_proj_b = nullptr;
-    const float* k_proj_w = nullptr;
-    const float* k_proj_b = nullptr;
-    const float* v_proj_w = nullptr;
-    const float* v_proj_b = nullptr;
-    const float* o_proj_w = nullptr;
+    Int8Tensor q_proj;
+    Int8Tensor k_proj;
+    Int8Tensor v_proj;
+    Int8Tensor o_proj;
 
-    const float* gate_proj_w = nullptr;
-    const float* up_proj_w = nullptr;
-    const float* down_proj_w = nullptr;
+    Int8Tensor gate_proj;
+    Int8Tensor up_proj;
+    Int8Tensor down_proj;
 
-    const float* input_layernorm_w = nullptr;
-    const float* post_attn_layernorm_w = nullptr;
+    std::vector<float> q_proj_b;
+    std::vector<float> k_proj_b;
+    std::vector<float> v_proj_b;
+
+    std::vector<float> input_layernorm_w;
+    std::vector<float> post_attn_layernorm_w;
 };
 
 struct ModelWeights {
-    const float* embed_tokens = nullptr;
-    const float* final_norm = nullptr;
-    const float* lm_head = nullptr;
+    std::vector<float> embed_tokens;
+    std::vector<float> final_norm;
+    std::vector<float> lm_head;
     std::vector<LayerWeights> layers;
 };
 

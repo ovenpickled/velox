@@ -23,6 +23,7 @@ public:
 
     bool open(const std::string& path);
     void close();
+    void clear();
 
     bool has_tensor(const std::string& name) const;
     TensorInfo get_tensor_info(const std::string& name) const;

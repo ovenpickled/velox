@@ -91,41 +91,51 @@ void Qwen2Model::reset(int batch_idx) {
 void Qwen2Model::load_weights() {
     weights_.layers.resize(config_.num_hidden_layers);
 
-    auto get_tensor_data = [&](const std::string& name) -> const float* {
-        if (!safetensors_.has_tensor(name)) return nullptr;
+    auto copy_tensor = [&](std::vector<float>& dest, const std::string& name) {
+        if (!safetensors_.has_tensor(name)) return;
         Tensor t = safetensors_.get_tensor(name);
-        stored_tensors_.push_back(t);
-        return stored_tensors_.back().data();
+        dest.assign(t.data(), t.data() + t.size());
     };
 
-    weights_.embed_tokens = get_tensor_data("model.embed_tokens.weight");
-    weights_.final_norm = get_tensor_data("model.norm.weight");
+    auto quantize_tensor = [&](Int8Tensor& dest, const std::string& name) {
+        if (!safetensors_.has_tensor(name)) return;
+        Tensor t = safetensors_.get_tensor(name);
+        // Safetensors shape is [N, K], so M = N (output dim), K = K (input dim)
+        ops::quantize_rowwise(dest, t.data(), t.shape(0), t.shape(1));
+    };
+
+    copy_tensor(weights_.embed_tokens, "model.embed_tokens.weight");
+    copy_tensor(weights_.final_norm, "model.norm.weight");
 
     if (config_.tie_word_embeddings) {
         weights_.lm_head = weights_.embed_tokens;
     } else {
-        weights_.lm_head = get_tensor_data("lm_head.weight");
+        copy_tensor(weights_.lm_head, "lm_head.weight");
     }
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
         std::string prefix = "model.layers." + std::to_string(i);
         LayerWeights& lw = weights_.layers[i];
 
-        lw.q_proj_w = get_tensor_data(prefix + ".self_attn.q_proj.weight");
-        lw.q_proj_b = get_tensor_data(prefix + ".self_attn.q_proj.bias");
-        lw.k_proj_w = get_tensor_data(prefix + ".self_attn.k_proj.weight");
-        lw.k_proj_b = get_tensor_data(prefix + ".self_attn.k_proj.bias");
-        lw.v_proj_w = get_tensor_data(prefix + ".self_attn.v_proj.weight");
-        lw.v_proj_b = get_tensor_data(prefix + ".self_attn.v_proj.bias");
-        lw.o_proj_w = get_tensor_data(prefix + ".self_attn.o_proj.weight");
+        quantize_tensor(lw.q_proj, prefix + ".self_attn.q_proj.weight");
+        copy_tensor(lw.q_proj_b, prefix + ".self_attn.q_proj.bias");
+        quantize_tensor(lw.k_proj, prefix + ".self_attn.k_proj.weight");
+        copy_tensor(lw.k_proj_b, prefix + ".self_attn.k_proj.bias");
+        quantize_tensor(lw.v_proj, prefix + ".self_attn.v_proj.weight");
+        copy_tensor(lw.v_proj_b, prefix + ".self_attn.v_proj.bias");
+        quantize_tensor(lw.o_proj, prefix + ".self_attn.o_proj.weight");
 
-        lw.gate_proj_w = get_tensor_data(prefix + ".mlp.gate_proj.weight");
-        lw.up_proj_w = get_tensor_data(prefix + ".mlp.up_proj.weight");
-        lw.down_proj_w = get_tensor_data(prefix + ".mlp.down_proj.weight");
+        quantize_tensor(lw.gate_proj, prefix + ".mlp.gate_proj.weight");
+        quantize_tensor(lw.up_proj, prefix + ".mlp.up_proj.weight");
+        quantize_tensor(lw.down_proj, prefix + ".mlp.down_proj.weight");
 
-        lw.input_layernorm_w = get_tensor_data(prefix + ".input_layernorm.weight");
-        lw.post_attn_layernorm_w = get_tensor_data(prefix + ".post_attention_layernorm.weight");
+        copy_tensor(lw.input_layernorm_w, prefix + ".input_layernorm.weight");
+        copy_tensor(lw.post_attn_layernorm_w, prefix + ".post_attention_layernorm.weight");
     }
+    
+    // Free the FP32 buffers from memory!
+    safetensors_.clear();
+    stored_tensors_.clear();
 }
 
 void Qwen2Model::allocate_buffers(int batch_size, int max_len, int max_total_len) {
@@ -190,7 +200,7 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
     for (int b = 0; b < batch_size; b++) {
         for (int p = 0; p < actual_lens[b]; p++) {
             ops::embedding_lookup(hidden_.data() + (b * max_len + p) * hidden_size,
-                                 weights_.embed_tokens, batch_tokens[b][p], hidden_size);
+                                 weights_.embed_tokens.data(), batch_tokens[b][p], hidden_size);
         }
     }
 
@@ -205,19 +215,19 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         for (int p = 0; p < total_positions; p++) {
             ops::rmsnorm(norm_out_.data() + p * hidden_size,
                         hidden_.data() + p * hidden_size,
-                        lw.input_layernorm_w, hidden_size, config_.rms_norm_eps);
+                        lw.input_layernorm_w.data(), hidden_size, config_.rms_norm_eps);
         }
 
-        // Q/K/V Projections (batched matmul: M = total_positions)
-        ops::matmul(q_buf_.data(), norm_out_.data(), lw.q_proj_w, total_positions, q_dim, hidden_size);
-        ops::matmul(k_buf_.data(), norm_out_.data(), lw.k_proj_w, total_positions, kv_dim, hidden_size);
-        ops::matmul(v_buf_.data(), norm_out_.data(), lw.v_proj_w, total_positions, kv_dim, hidden_size);
+        // Q/K/V Projections (batched W8A8 matmul: M = total_positions)
+        ops::matmul_w8a8(q_buf_.data(), norm_out_.data(), lw.q_proj, total_positions, q_dim, hidden_size);
+        ops::matmul_w8a8(k_buf_.data(), norm_out_.data(), lw.k_proj, total_positions, kv_dim, hidden_size);
+        ops::matmul_w8a8(v_buf_.data(), norm_out_.data(), lw.v_proj, total_positions, kv_dim, hidden_size);
 
         // Bias (all positions)
         for (int p = 0; p < total_positions; p++) {
-            ops::add_bias(q_buf_.data() + p * q_dim, lw.q_proj_b, q_dim);
-            ops::add_bias(k_buf_.data() + p * kv_dim, lw.k_proj_b, kv_dim);
-            ops::add_bias(v_buf_.data() + p * kv_dim, lw.v_proj_b, kv_dim);
+            ops::add_bias(q_buf_.data() + p * q_dim, lw.q_proj_b.data(), q_dim);
+            ops::add_bias(k_buf_.data() + p * kv_dim, lw.k_proj_b.data(), kv_dim);
+            ops::add_bias(v_buf_.data() + p * kv_dim, lw.v_proj_b.data(), kv_dim);
         }
 
         // RoPE (per-sequence positions, skip padding)
@@ -284,8 +294,8 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
             }
         }
 
-        // O Projection + Residual (batched matmul)
-        ops::matmul(hidden_.data(), attn_out_.data(), lw.o_proj_w, total_positions, hidden_size, q_dim);
+        // O Projection + Residual (batched W8A8 matmul)
+        ops::matmul_w8a8(hidden_.data(), attn_out_.data(), lw.o_proj, total_positions, hidden_size, q_dim);
         ops::add(hidden_.data(), hidden_.data(), residual_.data(), total_positions * hidden_size);
 
         // FFN
@@ -294,15 +304,15 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         for (int p = 0; p < total_positions; p++) {
             ops::rmsnorm(norm_out_.data() + p * hidden_size,
                         hidden_.data() + p * hidden_size,
-                        lw.post_attn_layernorm_w, hidden_size, config_.rms_norm_eps);
+                        lw.post_attn_layernorm_w.data(), hidden_size, config_.rms_norm_eps);
         }
 
-        ops::matmul(ffn_gate_.data(), norm_out_.data(), lw.gate_proj_w, total_positions, intermediate_size, hidden_size);
-        ops::matmul(ffn_up_.data(), norm_out_.data(), lw.up_proj_w, total_positions, intermediate_size, hidden_size);
+        ops::matmul_w8a8(ffn_gate_.data(), norm_out_.data(), lw.gate_proj, total_positions, intermediate_size, hidden_size);
+        ops::matmul_w8a8(ffn_up_.data(), norm_out_.data(), lw.up_proj, total_positions, intermediate_size, hidden_size);
 
         ops::silu(ffn_gate_.data(), total_positions * intermediate_size);
         ops::multiply(ffn_gate_.data(), ffn_gate_.data(), ffn_up_.data(), total_positions * intermediate_size);
-        ops::matmul(hidden_.data(), ffn_gate_.data(), lw.down_proj_w, total_positions, hidden_size, intermediate_size);
+        ops::matmul_w8a8(hidden_.data(), ffn_gate_.data(), lw.down_proj, total_positions, hidden_size, intermediate_size);
 
         ops::add(hidden_.data(), hidden_.data(), residual_.data(), total_positions * hidden_size);
     }
@@ -313,9 +323,9 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         int last_pos = b * max_len + actual_lens[b] - 1;
         ops::rmsnorm(norm_out_.data() + b * hidden_size,
                     hidden_.data() + last_pos * hidden_size,
-                    weights_.final_norm, hidden_size, config_.rms_norm_eps);
+                    weights_.final_norm.data(), hidden_size, config_.rms_norm_eps);
     }
-    ops::matmul(logits, norm_out_.data(), weights_.lm_head, batch_size, config_.vocab_size, hidden_size);
+    ops::matmul(logits, norm_out_.data(), weights_.lm_head.data(), batch_size, config_.vocab_size, hidden_size);
 
     // Update cache positions
     for (int b = 0; b < batch_size; b++) {

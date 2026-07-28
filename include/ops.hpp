@@ -1,7 +1,11 @@
 #pragma once
 #include <cstddef>
+#include "tensor.hpp"
 
 namespace ops {
+
+void quantize_rowwise(Int8Tensor& out, const float* weights, int M, int K);
+void matmul_w8a8(float* out, const float* a, const Int8Tensor& w, int M, int N, int K);
 
 void matmul(float* out, const float* a, const float* b, int M, int N, int K);
 void rmsnorm(float* out, const float* x, const float* weight, int size, float eps);

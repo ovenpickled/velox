@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <string>
+#include <cstdint>
 
 class Tensor {
 public:
@@ -38,4 +39,11 @@ private:
     float* data_ = nullptr;
     std::vector<int> shape_;
     bool owns_data_ = false;
+};
+
+struct Int8Tensor {
+    std::vector<int8_t> data;
+    std::vector<float> scales; // one scale per row
+    int M = 0; // number of rows (output channels)
+    int K = 0; // number of cols (input channels)
 };

@@ -67,14 +67,20 @@ bool SafetensorsFile::open(const std::string& path) {
 }
 
 void SafetensorsFile::close() {
-    if (mapped_data_) {
+    if (mapped_data_ && mapped_data_ != MAP_FAILED) {
         munmap(mapped_data_, file_size_);
         mapped_data_ = nullptr;
     }
-    if (fd_ >= 0) {
+    if (fd_ != -1) {
         ::close(fd_);
         fd_ = -1;
     }
+    tensors_.clear();
+    converted_tensors_.clear();
+}
+
+void SafetensorsFile::clear() {
+    converted_tensors_.clear();
 }
 
 bool SafetensorsFile::has_tensor(const std::string& name) const {

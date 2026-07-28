@@ -6,6 +6,77 @@
 
 namespace ops {
 
+void quantize_rowwise(Int8Tensor& out, const float* weights, int M, int K) {
+    out.M = M;
+    out.K = K;
+    out.data.resize(M * K);
+    out.scales.resize(M);
+
+    #pragma omp parallel for
+    for (int i = 0; i < M; i++) {
+        float max_val = 0.0f;
+        for (int j = 0; j < K; j++) {
+            float val = std::abs(weights[i * K + j]);
+            if (val > max_val) max_val = val;
+        }
+
+        float scale = max_val / 127.0f;
+        out.scales[i] = scale;
+
+        float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+        for (int j = 0; j < K; j++) {
+            float scaled = weights[i * K + j] * inv_scale;
+            int8_t q = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
+            out.data[i * K + j] = q;
+        }
+    }
+}
+
+void matmul_w8a8(float* out, const float* a, const Int8Tensor& w, int M, int N, int K) {
+    // a: [M, K]
+    // w: [N, K] (quantized, transposed)
+    // out: [M, N]
+
+    // 1. Dynamic quantization of activations 'a'
+    std::vector<int8_t> a_q(M * K);
+    std::vector<float> a_scales(M);
+
+    #pragma omp parallel for
+    for (int i = 0; i < M; i++) {
+        float max_val = 0.0f;
+        for (int j = 0; j < K; j++) {
+            float val = std::abs(a[i * K + j]);
+            if (val > max_val) max_val = val;
+        }
+
+        float scale = max_val / 127.0f;
+        a_scales[i] = scale;
+
+        float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+        for (int j = 0; j < K; j++) {
+            float scaled = a[i * K + j] * inv_scale;
+            a_q[i * K + j] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
+        }
+    }
+
+    // 2. W8A8 Matmul
+    #pragma omp parallel for
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t sum = 0;
+            const int8_t* row_a = a_q.data() + i * K;
+            const int8_t* row_w = w.data.data() + j * K;
+            
+            // Loop unrolling / vectorization opportunity
+            for (int k = 0; k < K; k++) {
+                sum += static_cast<int32_t>(row_a[k]) * static_cast<int32_t>(row_w[k]);
+            }
+            
+            out[i * N + j] = static_cast<float>(sum) * a_scales[i] * w.scales[j];
+        }
+    }
+}
+
 void matmul(float* out, const float* a, const float* b, int M, int N, int K) {
     #pragma omp parallel for
     for (int i0 = 0; i0 < M; i0 += 32) {
