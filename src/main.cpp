@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <fstream>
+#include <cstdlib>
 #include "model.hpp"
 #include "tokenizer.hpp"
 #include "sampler.hpp"
@@ -184,6 +186,12 @@ int main(int argc, char* argv[]) {
         auto start_time = high_resolution_clock::now();
 
         model.forward(input_tokens, logits.data());
+        if (const char* dump = std::getenv("VELOX_DUMP_LOGITS")) {
+            std::ofstream f(dump, std::ios::binary);
+            int32_t n = vocab_size;
+            f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            f.write(reinterpret_cast<const char*>(logits.data()), n * sizeof(float));
+        }
         int next_token = sampler.sample(logits.data(), vocab_size);
         int generated_count = 1;
 

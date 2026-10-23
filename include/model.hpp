@@ -42,7 +42,7 @@ struct LayerWeights {
 struct ModelWeights {
     std::vector<float> embed_tokens;
     std::vector<float> final_norm;
-    std::vector<float> lm_head;
+    Int8Tensor lm_head;
     std::vector<LayerWeights> layers;
 };
 

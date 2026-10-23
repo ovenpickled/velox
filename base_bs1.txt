@@ -1,0 +1,10 @@
+Loading model from /home/awwwyan/models/Qwen2.5-0.5B...
+Loading tokenizer...
+Encoded prompt into 1 tokens: [9707]
+Hello reallly sorry for the long post but i have a problem with my code and i can't figure it out. I have a class called "MyClass" and i want to call it from another class called "MyOtherClass". I have a constructor in my "MyClass" class that takes a parameter and calls the constructor of my "MyOtherClass" class. I want to call the constructor of my "MyOtherClass" class from my "MyClass" class. I have tried to use the "this" keyword but it doesn't seem to work. Here is my code:
+
+```
+public class MyClass
+{
+
+

@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cstring>
 #include <omp.h>
+#include <cstdlib>
+#include <cstdio>
+#include <vector>
 
 namespace ops {
 
@@ -32,64 +35,100 @@ void quantize_rowwise(Int8Tensor& out, const float* weights, int M, int K) {
     }
 }
 
+#ifndef ACT_GROUP
+#define ACT_GROUP 64
+#endif
+
+// Diagnostic only: INT8 weights, FP32 activations (no activation quantization)
+static void matmul_w8a32(float* out, const float* a, const Int8Tensor& w, int M, int N, int K) {
+    const int8_t* wd = w.data.data();
+    const float* ws = w.scales.data();
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < N; j++) {
+        const int8_t* row_w = wd + static_cast<size_t>(j) * K;
+        for (int i = 0; i < M; i++) {
+            const float* row_a = a + static_cast<size_t>(i) * K;
+            float sum = 0.0f;
+            #pragma omp simd reduction(+:sum)
+            for (int k = 0; k < K; k++) sum += row_a[k] * static_cast<float>(row_w[k]);
+            out[static_cast<size_t>(i) * N + j] = sum * ws[j];
+        }
+    }
+}
+
 void matmul_w8a8(float* out, const float* a, const Int8Tensor& w, int M, int N, int K) {
-    // a: [M, K]
-    // w: [N, K] (quantized, transposed)
-    // out: [M, N]
+    static const bool w8a32 = [] {
+        bool on = std::getenv("VELOX_W8A32") != nullptr;
+        if (on) std::fprintf(stderr, "[diag] W8A32 path active\n");
+        return on;
+    }();
+    if (w8a32) { matmul_w8a32(out, a, w, M, N, K); return; }
 
-    // 1. Dynamic quantization of activations 'a'
-    std::vector<int8_t> a_q(M * K);
-    std::vector<float> a_scales(M);
+    const int G = (K + ACT_GROUP - 1) / ACT_GROUP;   // activation groups per row
+    static thread_local std::vector<int8_t> a_q_buf;
+    static thread_local std::vector<float> a_scales_buf;
+    if (a_q_buf.size() < static_cast<size_t>(M) * K) a_q_buf.resize(static_cast<size_t>(M) * K);
+    if (a_scales_buf.size() < static_cast<size_t>(M) * G) a_scales_buf.resize(static_cast<size_t>(M) * G);
+    int8_t* a_q = a_q_buf.data();
+    float* a_scales = a_scales_buf.data();
 
+    // 1. Quantize activations: one scale per group of ACT_GROUP channels
     #pragma omp parallel for
     for (int i = 0; i < M; i++) {
-        float max_val = 0.0f;
-        for (int j = 0; j < K; j++) {
-            float val = std::abs(a[i * K + j]);
-            if (val > max_val) max_val = val;
-        }
-
-        float scale = max_val / 127.0f;
-        a_scales[i] = scale;
-
-        float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
-        for (int j = 0; j < K; j++) {
-            float scaled = a[i * K + j] * inv_scale;
-            a_q[i * K + j] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
+        const float* src = a + static_cast<size_t>(i) * K;
+        for (int g = 0; g < G; g++) {
+            const int k0 = g * ACT_GROUP, k1 = std::min(k0 + ACT_GROUP, K);
+            float max_val = 0.0f;
+            for (int k = k0; k < k1; k++) max_val = std::max(max_val, std::abs(src[k]));
+            const float scale = max_val / 127.0f;
+            a_scales[static_cast<size_t>(i) * G + g] = scale;
+            const float inv = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+            for (int k = k0; k < k1; k++) {
+                float s = src[k] * inv;
+                a_q[static_cast<size_t>(i) * K + k] =
+                    static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, s))));
+            }
         }
     }
 
-    // 2. W8A8 Matmul
-    #pragma omp parallel for
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            int32_t sum = 0;
-            const int8_t* row_a = a_q.data() + i * K;
-            const int8_t* row_w = w.data.data() + j * K;
-            
-            // Loop unrolling / vectorization opportunity
-            for (int k = 0; k < K; k++) {
-                sum += static_cast<int32_t>(row_a[k]) * static_cast<int32_t>(row_w[k]);
+    // 2. Matmul: int32 dot product per group, rescaled by that group's scale
+    const int8_t* wd = w.data.data();
+    const float* ws = w.scales.data();
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < N; j++) {
+        const int8_t* row_w = wd + static_cast<size_t>(j) * K;
+        const float wscale = ws[j];
+        for (int i = 0; i < M; i++) {
+            const int8_t* row_a = a_q + static_cast<size_t>(i) * K;
+            const float* sc = a_scales + static_cast<size_t>(i) * G;
+            float acc = 0.0f;
+            for (int g = 0; g < G; g++) {
+                const int k0 = g * ACT_GROUP, k1 = std::min(k0 + ACT_GROUP, K);
+                int32_t s = 0;
+                for (int k = k0; k < k1; k++) {
+                    s += static_cast<int32_t>(row_a[k]) * static_cast<int32_t>(row_w[k]);
+                }
+                acc += static_cast<float>(s) * sc[g];
             }
-            
-            out[i * N + j] = static_cast<float>(sum) * a_scales[i] * w.scales[j];
+            out[static_cast<size_t>(i) * N + j] = acc * wscale;
         }
     }
 }
 
 void matmul(float* out, const float* a, const float* b, int M, int N, int K) {
-    #pragma omp parallel for
-    for (int i0 = 0; i0 < M; i0 += 32) {
-        for (int j0 = 0; j0 < N; j0 += 32) {
-            for (int i = i0; i < std::min(i0 + 32, M); ++i) {
-                for (int j = j0; j < std::min(j0 + 32, N); ++j) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < K; ++k) {
-                        sum += a[i * K + k] * b[j * K + k];
-                    }
-                    out[i * N + j] = sum;
-                }
+    // a: [M, K]   b: [N, K]   out: [M, N]. Parallel over N; the simd reduction
+    // lets the compiler vectorize the dot product without -ffast-math.
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < N; j++) {
+        const float* row_b = b + static_cast<size_t>(j) * K;
+        for (int i = 0; i < M; i++) {
+            const float* row_a = a + static_cast<size_t>(i) * K;
+            float sum = 0.0f;
+            #pragma omp simd reduction(+:sum)
+            for (int k = 0; k < K; ++k) {
+                sum += row_a[k] * row_b[k];
             }
+            out[static_cast<size_t>(i) * N + j] = sum;
         }
     }
 }

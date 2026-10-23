@@ -6,6 +6,9 @@
 #include <algorithm>
 #include "json.hpp"
 #include "ops.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 using json = nlohmann::json;
 
@@ -88,13 +91,20 @@ void Qwen2Model::load_weights() {
         ops::quantize_rowwise(dest, t.data(), t.shape(0), t.shape(1));
     };
 
-    copy_tensor(weights_.embed_tokens, "model.embed_tokens.weight");
     copy_tensor(weights_.final_norm, "model.norm.weight");
 
-    if (config_.tie_word_embeddings) {
-        weights_.lm_head = weights_.embed_tokens;
-    } else {
-        copy_tensor(weights_.lm_head, "lm_head.weight");
+    // Embedding table: keep an exact FP32 copy for token lookups. When tied,
+    // quantize the same data once for the output projection instead of
+    // keeping a second FP32 copy.
+    if (safetensors_.has_tensor("model.embed_tokens.weight")) {
+        Tensor t = safetensors_.get_tensor("model.embed_tokens.weight");
+        weights_.embed_tokens.assign(t.data(), t.data() + t.size());
+        if (config_.tie_word_embeddings) {
+            ops::quantize_rowwise(weights_.lm_head, t.data(), t.shape(0), t.shape(1));
+        }
+    }
+    if (!config_.tie_word_embeddings) {
+        quantize_tensor(weights_.lm_head, "lm_head.weight");
     }
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
@@ -151,7 +161,22 @@ void Qwen2Model::forward(const std::vector<int>& tokens, float* logits) {
 // --- Batched Forward Pass ---
 
 void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens, float* logits) {
+    auto t_fwd0 = std::chrono::steady_clock::now();
     int batch_size = batch_tokens.size();
+    static const bool dbg_on = std::getenv("VELOX_DEBUG_ACT") != nullptr;
+    static int dbg_calls = 0;
+    const bool dbg_now = dbg_on && (dbg_calls++ == 0);   // first call (prefill) only
+    auto dbg_stats = [&](int layer, const char* name, const float* x, int n, const char* where) {
+        float mx = 0, sum = 0; int arg = 0;
+        for (int i = 0; i < n; i++) {
+            float v = std::fabs(x[i]);
+            if (v > mx) { mx = v; arg = i; }
+            sum += v;
+        }
+        float mean = sum / n;
+        std::fprintf(stderr, "[act] L%02d %-8s %-5s max %9.2f  mean %8.4f  ratio %7.1f  ch %d\n",
+                     layer, name, where, mx, mean, mx / (mean + 1e-9f), arg);
+    };
 
     // Per-sequence metadata
     std::vector<int> actual_lens(batch_size);
@@ -306,9 +331,19 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
 
         ops::silu(ffn_gate_.data(), total_positions * intermediate_size);
         ops::multiply(ffn_gate_.data(), ffn_gate_.data(), ffn_up_.data(), total_positions * intermediate_size);
+        if (dbg_now) {
+            int last = actual_lens[0] - 1;
+            dbg_stats(layer, "down_in", ffn_gate_.data() + 0 * intermediate_size, intermediate_size, "pos0");
+            dbg_stats(layer, "down_in", ffn_gate_.data() + last * intermediate_size, intermediate_size, "last");
+        }
         ops::matmul_w8a8(hidden_.data(), ffn_gate_.data(), lw.down_proj, total_positions, hidden_size, intermediate_size);
 
         ops::add(hidden_.data(), hidden_.data(), residual_.data(), total_positions * hidden_size);
+        if (dbg_now) {
+            int last = actual_lens[0] - 1;
+            dbg_stats(layer, "hidden", hidden_.data() + 0 * hidden_size, hidden_size, "pos0");
+            dbg_stats(layer, "hidden", hidden_.data() + last * hidden_size, hidden_size, "last");
+        }
     }
 
     // --- Final Norm + LM Head (batched) ---
@@ -319,10 +354,19 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                     hidden_.data() + last_pos * hidden_size,
                     weights_.final_norm.data(), hidden_size, config_.rms_norm_eps);
     }
-    ops::matmul(logits, norm_out_.data(), weights_.lm_head.data(), batch_size, config_.vocab_size, hidden_size);
+    auto t_lm0 = std::chrono::steady_clock::now();
+    ops::matmul_w8a8(logits, norm_out_.data(), weights_.lm_head, batch_size, config_.vocab_size, config_.hidden_size);
+    auto t_lm1 = std::chrono::steady_clock::now();
 
     // Update cache positions
     for (int b = 0; b < batch_size; b++) {
         kv_caches_[b].seq_len = past_lens[b] + actual_lens[b];
     }
+    auto t_fwd1 = std::chrono::steady_clock::now();
+    static double lm_ms = 0, fwd_ms = 0; static int n = 0;
+    lm_ms  += std::chrono::duration<double, std::milli>(t_lm1  - t_lm0 ).count();
+    fwd_ms += std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count();
+    if (++n % 32 == 0)
+        std::fprintf(stderr, "[prof] bs=%d  lm_head %.1f ms  forward %.1f ms  (%.0f%%)\n",
+                     batch_size, lm_ms / n, fwd_ms / n, 100.0 * lm_ms / fwd_ms);
 }
