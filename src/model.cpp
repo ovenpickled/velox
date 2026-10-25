@@ -263,7 +263,18 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                                     " exceeds the model's max batch size " + std::to_string(max_batch_size_));
     }
     static const bool prof_on = std::getenv("VELOX_PROF") != nullptr;   // per-step timing summary on stderr
+    static const int  prof_detail = [] {
+        const char* v = std::getenv("VELOX_PROF");
+        return (v && std::string(v) == "2") ? 2 : 0;
+    }();
     static const bool dbg_on = std::getenv("VELOX_DEBUG_ACT") != nullptr;
+
+    // Per-component accumulators for detailed profiling (VELOX_PROF=2)
+    using DurMS = std::chrono::duration<double, std::milli>;
+    double prof_norm_ms = 0, prof_qkv_ms = 0, prof_rope_bias_ms = 0;
+    double prof_attn_ms = 0, prof_oproj_ms = 0;
+    double prof_ffn_norm_ms = 0, prof_ffn_proj_ms = 0, prof_ffn_act_ms = 0;
+    auto tick = [&]{ return std::chrono::steady_clock::now(); };
     static int dbg_calls = 0;
     const bool dbg_now = dbg_on && (dbg_calls++ == 0);   // first call (prefill) only
     auto dbg_stats = [&](int layer, const char* name, const float* x, int n, const char* where) {
