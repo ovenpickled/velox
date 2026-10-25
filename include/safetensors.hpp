@@ -42,4 +42,5 @@ private:
     std::vector<std::vector<float>> converted_tensors_;
 
     float bf16_to_float(uint16_t val) const;
+    float f16_to_float(uint16_t val) const;
 };

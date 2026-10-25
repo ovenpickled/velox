@@ -10,7 +10,8 @@ Sampler::Sampler(SamplerConfig config) : config_(config) {
 }
 
 int Sampler::sample(const float* logits, int vocab_size) {
-    if (config_.greedy) {
+    // temperature <= 0 would divide by zero below; it means "always pick the best token"
+    if (config_.greedy || config_.temperature <= 0.0f) {
         return greedy_sample(logits, vocab_size);
     }
     return top_k_top_p_sample(logits, vocab_size);

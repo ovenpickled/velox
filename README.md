@@ -4,15 +4,15 @@ A C++ inference engine for running Qwen2.5-style transformer models on CPU. It l
 
 ## Techniques
 
-- **Memory-mapped model loading** - [`safetensors.cpp`](src/safetensors.cpp) maps the model file directly into memory with [`mmap`](https://man7.org/linux/man-pages/man2/mmap.2.html) instead of reading it into a buffer. Tensors are read straight from the mapped region, so the OS handles paging and the engine avoids a full-file copy on startup.
-- **Row-wise INT8 quantization (W8A8)** - Weights are quantized once at load time in [`ops::quantize_rowwise`](src/ops.cpp), with one scale factor per output row. Activations are quantized dynamically on every forward pass in [`ops::matmul_w8a8`](src/ops.cpp) before the integer matmul runs, then rescaled back to float. This cuts memory bandwidth roughly 4x compared to FP32 weights.
+- **Memory-mapped model loading** - [`safetensors.cpp`](src/safetensors.cpp) maps the model file directly into memory with [`mmap`](https://man7.org/linux/man-pages/man2/mmap.2.html) instead of reading it into a buffer. Tensors are read from the mapped region. F32 tensors are read in place; BF16 and F16 tensors are converted to FP32 once during loading (a temporary copy), quantized, and then the FP32 copies are freed and the file is unmapped.
+- **Row-wise INT8 quantization (W8A8)** - Weights are quantized once at load time in [`ops::quantize_rowwise`](src/ops.cpp), with one scale factor per output row. Activations are quantized dynamically on every forward pass in [`ops::matmul_w8a8`](src/ops.cpp) with one scale per group of 64 channels (`ACT_GROUP`), so a single outlier channel cannot wipe out the precision of the whole row. The integer dot product is rescaled per group. The LM head is quantized too, which cuts the bytes streamed per decoded token roughly 4x compared to FP32 weights.
 - **Grouped-query attention** - [`model.hpp`](include/model.hpp) configures fewer key/value heads (`num_key_value_heads`) than query heads (`num_attention_heads`), so multiple query heads share the same K/V projections. This shrinks the KV cache without changing attention quality much. See the [original GQA paper](https://arxiv.org/abs/2305.13245) for background.
 - **Rotary position embeddings (RoPE)** - [`ops::rope`](src/ops.cpp) rotates query/key vectors by an angle derived from token position instead of adding a position vector. It encodes relative position directly into the attention dot product.
 - **Amortized KV cache growth** - [`KVCache::ensure_capacity`](include/model.hpp) doubles the cache buffer whenever it runs out of room, the same growth strategy used internally by [`std::vector`](https://en.cppreference.com/w/cpp/container/vector). This keeps reallocation cost to `O(1)` amortized per token instead of resizing on every step.
-- **Cache-blocked matrix multiplication** - the fallback FP32 [`ops::matmul`](src/ops.cpp) tiles the computation into 32x32 blocks rather than looping naively, keeping working data inside CPU cache lines longer.
+- **Output-dimension parallel matmuls** - [`ops::matmul_w8a8`](src/ops.cpp) parallelizes over the output dimension `N` with the batch rows in the inner loop, so every weight row is streamed from memory once and reused for all sequences in the batch. (Parallelizing over the batch dimension left almost every core idle during decode.)
 - **Conditional OpenMP parallelization** - attention loops use [`#pragma omp parallel for collapse(2)`](https://www.openmp.org/spec-html/5.0/openmpsu41.html), but only when `batch_size * num_heads` is large enough to justify thread spin-up. Small single-sequence workloads run single-threaded to avoid overhead.
 - **BF16 to FP32 conversion via bit manipulation** - [`SafetensorsFile::bf16_to_float`](src/safetensors.cpp) reconstructs a float from a bfloat16 value by shifting its bits into the upper 16 bits of a 32-bit float, since BF16 is just a truncated FP32.
-- **Byte-level BPE tokenizer without regex** - [`tokenizer.cpp`](src/tokenizer.cpp) reimplements GPT-2's byte-level pre-tokenizer using manual character classification instead of a regex engine, matching Hugging Face's `transformers` tokenizer output.
+- **Byte-level BPE tokenizer without regex** - [`tokenizer.cpp`](src/tokenizer.cpp) implements Qwen2's pre-tokenizer split rules by hand (single digits, optional leading punctuation, Unicode letters and numbers via the generated tables in [`unicode_tables.hpp`](include/unicode_tables.hpp)) instead of using a regex engine, and maps special tokens such as `<|im_start|>` to their ids. It was fuzz-tested against the reference regex; check it against your own `tokenizer.json` with [`scripts/check_tokenizer.py`](scripts/check_tokenizer.py).
 - **Non-owning tensor views** - [`Tensor::view`](include/tensor.hpp) and [`Tensor::row`](include/tensor.hpp) reinterpret existing memory with a new shape instead of copying data, similar to how NumPy views work.
 
 ## Notable Libraries & Technologies
@@ -39,7 +39,17 @@ A C++ inference engine for running Qwen2.5-style transformer models on CPU. It l
 - [`src/`](src/) - implementation files, including the main inference loop and CLI entry point in [`main.cpp`](src/main.cpp).
 - [`scripts/`](scripts/) - Python tooling for cross-checking output against Hugging Face `transformers`.
 
+## Diagnostics
+
+- `--tokenize-only` prints the prompt's token ids as a JSON list and exits without loading the model.
+- `VELOX_PROF=1` prints a running average of forward-pass and LM-head time to stderr.
+- `VELOX_DUMP_LOGITS=<file>` writes the first-step logits (single-sequence mode) in the format [`scripts/compare.py`](scripts/compare.py) reads.
+- `VELOX_W8A32=1` runs the projections with FP32 activations (INT8 weights) to separate weight-quantization error from activation-quantization error.
+- `VELOX_DEBUG_ACT=1` prints per-layer activation statistics for the prefill pass.
+
 ## Benchmarks
+
+> These numbers predate the output-dimension parallel matmuls and the INT8 LM head, so they are out of date. Re-run `./build/inference --model <dir> --benchmark` to refresh them.
 
 Measured on a Qwen2.5-0.5B model, 15 repetitions per batch size, median ± standard deviation:
 

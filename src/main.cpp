@@ -6,13 +6,57 @@
 #include <algorithm>
 #include <fstream>
 #include <cstdlib>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
 #include "model.hpp"
 #include "tokenizer.hpp"
 #include "sampler.hpp"
 
 using namespace std::chrono;
 
-int main(int argc, char* argv[]) {
+static int parse_int(const std::string& flag, const char* text) {
+    try {
+        size_t used = 0;
+        int v = std::stoi(text, &used);
+        if (used != std::strlen(text)) throw std::invalid_argument("trailing characters");
+        return v;
+    } catch (const std::exception&) {
+        throw std::invalid_argument("invalid value for " + flag + ": '" + text + "'");
+    }
+}
+
+static float parse_float(const std::string& flag, const char* text) {
+    try {
+        size_t used = 0;
+        float v = std::stof(text, &used);
+        if (used != std::strlen(text)) throw std::invalid_argument("trailing characters");
+        return v;
+    } catch (const std::exception&) {
+        throw std::invalid_argument("invalid value for " + flag + ": '" + text + "'");
+    }
+}
+
+// Removes and returns the longest prefix of `pending` that ends on a UTF-8 character boundary.
+// A multi-byte character can be split across tokens; the incomplete tail stays in `pending`
+// until the next token completes it.
+static std::string take_complete_utf8(std::string& pending) {
+    const size_t n = pending.size();
+    size_t keep = 0;  // trailing bytes that belong to a not-yet-complete character
+    for (size_t back = 1; back <= 3 && back <= n; ++back) {
+        unsigned char c = static_cast<unsigned char>(pending[n - back]);
+        if ((c & 0xC0) == 0x80) continue;  // continuation byte: keep looking for the lead byte
+        size_t need = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+        if (need > back) keep = back;      // lead byte whose sequence is cut off
+        break;
+    }
+    std::string out = pending.substr(0, n - keep);
+    pending.erase(0, n - keep);
+    return out;
+}
+
+static int run(int argc, char* argv[]) {
     std::string model_dir;
     std::string prompt = "Hello";
     int max_tokens = 64;
@@ -20,22 +64,53 @@ int main(int argc, char* argv[]) {
     float temperature = 1.0f;
     bool greedy = true;
     bool benchmark = false;
+    bool tokenize_only = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--model" && i+1 < argc) model_dir = argv[++i];
-        else if (arg == "--prompt" && i+1 < argc) prompt = argv[++i];
-        else if (arg == "--max-tokens" && i+1 < argc) max_tokens = std::stoi(argv[++i]);
-        else if (arg == "--batch-size" && i+1 < argc) batch_size = std::stoi(argv[++i]);
-        else if (arg == "--temperature" && i+1 < argc) { temperature = std::stof(argv[++i]); greedy = false; }
+        auto value = [&]() -> const char* {
+            if (i + 1 >= argc) throw std::invalid_argument("missing value for " + arg);
+            return argv[++i];
+        };
+        if (arg == "--model") model_dir = value();
+        else if (arg == "--prompt") prompt = value();
+        else if (arg == "--max-tokens") max_tokens = parse_int(arg, value());
+        else if (arg == "--batch-size") batch_size = parse_int(arg, value());
+        else if (arg == "--temperature") { temperature = parse_float(arg, value()); greedy = false; }
         else if (arg == "--greedy") greedy = true;
         else if (arg == "--benchmark") benchmark = true;
+        else if (arg == "--tokenize-only") tokenize_only = true;
+        else throw std::invalid_argument("unknown argument: " + arg);
     }
 
     if (model_dir.empty()) {
         std::cerr << "Usage: inference --model <path> [--prompt <text>] [--max-tokens N] "
-                  << "[--batch-size N] [--temperature T] [--greedy]" << std::endl;
+                  << "[--batch-size N] [--temperature T] [--greedy] [--benchmark] [--tokenize-only]" << std::endl;
         return 1;
+    }
+    if (max_tokens < 1) throw std::invalid_argument("--max-tokens must be at least 1");
+    if (batch_size < 1) throw std::invalid_argument("--batch-size must be at least 1");
+    if (!greedy && temperature <= 0.0f) {
+        std::cerr << "Note: --temperature <= 0 means greedy decoding" << std::endl;
+        greedy = true;
+    }
+
+    // The tokenizer is cheap to load, so do it first: bad prompts fail before the model is loaded
+    Tokenizer tokenizer;
+    if (!tokenizer.load(model_dir + "/tokenizer.json")) {
+        std::cerr << "Failed to load tokenizer from " << model_dir << "/tokenizer.json" << std::endl;
+        return 1;
+    }
+    auto input_tokens = tokenizer.encode(prompt);
+
+    if (tokenize_only) {  // prints the ids as a JSON list, e.g. [9707,11]; used to compare against Hugging Face
+        std::cout << "[";
+        for (size_t i = 0; i < input_tokens.size(); i++) std::cout << (i ? "," : "") << input_tokens[i];
+        std::cout << "]" << std::endl;
+        return 0;
+    }
+    if (input_tokens.empty()) {
+        throw std::invalid_argument("the prompt encodes to zero tokens; please give a non-empty --prompt");
     }
 
     std::cout << "Loading model from " << model_dir << "..." << std::endl;
@@ -46,11 +121,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "Loading tokenizer..." << std::endl;
-    Tokenizer tokenizer;
-    if (!tokenizer.load(model_dir + "/tokenizer.json")) {
-        std::cerr << "Failed to load tokenizer" << std::endl;
-        return 1;
+    // The prompt takes L KV-cache slots and every further generated token takes one more
+    const int ctx = model.max_context();
+    const int prompt_len = static_cast<int>(input_tokens.size());
+    if (prompt_len >= ctx) {
+        throw std::invalid_argument("the prompt is " + std::to_string(prompt_len) +
+                                    " tokens but the context limit is " + std::to_string(ctx));
+    }
+    if (max_tokens > ctx - prompt_len + 1) {
+        max_tokens = ctx - prompt_len + 1;
+        std::cerr << "Note: --max-tokens reduced to " << max_tokens << " to fit the " << ctx << "-token context limit" << std::endl;
     }
 
     SamplerConfig sampler_config;
@@ -58,7 +138,6 @@ int main(int argc, char* argv[]) {
     sampler_config.temperature = temperature;
     Sampler sampler(sampler_config);
 
-    auto input_tokens = tokenizer.encode(prompt);
     int vocab_size = model.config().vocab_size;
 
     std::cout << "Encoded prompt into " << input_tokens.size() << " tokens: [";
@@ -108,6 +187,10 @@ int main(int argc, char* argv[]) {
                 model.forward_batch(batch_prompts, batch_logits.data());
                 for (int b = 0; b < bs; b++) {
                     next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
+                    if (tokenizer.is_eos(next_tokens[b])) {   // a sequence can end on its very first token
+                        done[b] = true;
+                        active_count--;
+                    }
                 }
 
                 auto first_token_time = high_resolution_clock::now();
@@ -126,7 +209,7 @@ int main(int argc, char* argv[]) {
                         next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
                         total_generated++;
 
-                        if (next_tokens[b] == tokenizer.eos_token_id()) {
+                        if (tokenizer.is_eos(next_tokens[b])) {
                             done[b] = true;
                             active_count--;
                         }
@@ -195,23 +278,30 @@ int main(int argc, char* argv[]) {
         int next_token = sampler.sample(logits.data(), vocab_size);
         int generated_count = 1;
 
-        std::cout << tokenizer.decode(next_token) << std::flush;
+        // Print tokens as they arrive, holding back the bytes of a UTF-8 character split across tokens
+        std::string pending;
+        auto emit = [&](int token) {
+            if (tokenizer.is_eos(token)) return;   // don't print <|endoftext|> and friends
+            pending += tokenizer.decode(token);
+            std::cout << take_complete_utf8(pending) << std::flush;
+        };
+        emit(next_token);
 
         auto first_token_time = high_resolution_clock::now();
 
         for (int i = 1; i < max_tokens; i++) {
-            if (next_token == tokenizer.eos_token_id()) break;
+            if (tokenizer.is_eos(next_token)) break;
 
             model.forward({next_token}, logits.data());
             next_token = sampler.sample(logits.data(), vocab_size);
             generated_count++;
 
-            std::cout << tokenizer.decode(next_token) << std::flush;
+            emit(next_token);
         }
 
         auto end_time = high_resolution_clock::now();
 
-        std::cout << std::endl;
+        std::cout << pending << std::endl;
         auto prefill_ms = duration_cast<milliseconds>(first_token_time - start_time).count();
         auto total_ms = duration_cast<milliseconds>(end_time - start_time).count();
         auto decode_ms = total_ms - prefill_ms;
@@ -244,7 +334,12 @@ int main(int argc, char* argv[]) {
         model.forward_batch(batch_prompts, batch_logits.data());
         for (int b = 0; b < batch_size; b++) {
             next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
-            outputs[b] += tokenizer.decode(next_tokens[b]);
+            if (tokenizer.is_eos(next_tokens[b])) {   // a sequence can end on its very first token
+                done[b] = true;
+                active_count--;
+            } else {
+                outputs[b] += tokenizer.decode(next_tokens[b]);
+            }
         }
 
         auto first_token_time = high_resolution_clock::now();
@@ -264,12 +359,13 @@ int main(int argc, char* argv[]) {
                 if (done[b]) continue;
 
                 next_tokens[b] = sampler.sample(batch_logits.data() + b * vocab_size, vocab_size);
-                outputs[b] += tokenizer.decode(next_tokens[b]);
                 total_generated++;
 
-                if (next_tokens[b] == tokenizer.eos_token_id()) {
+                if (tokenizer.is_eos(next_tokens[b])) {
                     done[b] = true;
                     active_count--;
+                } else {
+                    outputs[b] += tokenizer.decode(next_tokens[b]);
                 }
             }
         }
@@ -300,4 +396,13 @@ int main(int argc, char* argv[]) {
     }
 
     return 0;
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
 }

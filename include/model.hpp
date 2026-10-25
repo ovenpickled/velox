@@ -99,6 +99,8 @@ public:
     void reset();
     void reset(int batch_idx);
     int max_batch_size() const;
+    // Longest sequence (prompt + generated tokens) the KV cache will accept
+    int max_context() const;
     const ModelConfig& config() const;
 
 private:
@@ -124,5 +126,5 @@ private:
     std::vector<Tensor> stored_tensors_;
 
     void allocate_buffers(int batch_size, int max_len, int max_total_len);
-    void load_weights();
+    bool load_weights();
 };

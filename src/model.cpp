@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 using json = nlohmann::json;
 
@@ -45,19 +47,35 @@ ModelConfig ModelConfig::from_json(const std::string& config_json_path) {
 
 const ModelConfig& Qwen2Model::config() const { return config_; }
 int Qwen2Model::max_batch_size() const { return max_batch_size_; }
+int Qwen2Model::max_context() const { return std::min(config_.max_position_embeddings, 4096); }
 
 bool Qwen2Model::load(const std::string& model_dir, int max_batch_size) {
     config_ = ModelConfig::from_json(model_dir + "/config.json");
+
+    if (config_.num_attention_heads <= 0 || config_.num_key_value_heads <= 0 ||
+        config_.hidden_size % config_.num_attention_heads != 0 ||
+        config_.num_attention_heads % config_.num_key_value_heads != 0) {
+        std::cerr << "Invalid model config: hidden_size=" << config_.hidden_size
+                  << " num_attention_heads=" << config_.num_attention_heads
+                  << " num_key_value_heads=" << config_.num_key_value_heads << std::endl;
+        return false;
+    }
+    if (max_batch_size < 1) {
+        std::cerr << "max_batch_size must be at least 1" << std::endl;
+        return false;
+    }
 
     if (!safetensors_.open(model_dir + "/model.safetensors")) {
         std::cerr << "Failed to open safetensors file: " << model_dir << "/model.safetensors" << std::endl;
         return false;
     }
 
-    load_weights();
+    if (!load_weights()) {
+        std::cerr << "Failed to load model weights from " << model_dir << std::endl;
+        return false;
+    }
 
     max_batch_size_ = max_batch_size;
-    int cache_max = std::min(config_.max_position_embeddings, 4096);
     kv_caches_.resize(max_batch_size);
     for (int b = 0; b < max_batch_size; b++) {
         kv_caches_[b].init(config_.num_hidden_layers, config_.num_key_value_heads, config_.head_dim, 128);
@@ -75,61 +93,103 @@ void Qwen2Model::reset(int batch_idx) {
     kv_caches_[batch_idx].reset();
 }
 
-void Qwen2Model::load_weights() {
+bool Qwen2Model::load_weights() {
     weights_.layers.resize(config_.num_hidden_layers);
 
-    auto copy_tensor = [&](std::vector<float>& dest, const std::string& name) {
-        if (!safetensors_.has_tensor(name)) return;
-        Tensor t = safetensors_.get_tensor(name);
+    bool ok = true;
+    auto fail = [&](const std::string& msg) {
+        std::cerr << "[load] " << msg << std::endl;
+        ok = false;
+    };
+
+    const int hidden = config_.hidden_size;
+    const int q_dim = config_.num_attention_heads * config_.head_dim;
+    const int kv_dim = config_.num_key_value_heads * config_.head_dim;
+    const int inter = config_.intermediate_size;
+
+    // Fetch a tensor and check that it exists, has a supported dtype, and has the expected
+    // shape (d0 x d1, or just d0 for 1-D). Pass -1 to skip the shape check.
+    auto fetch = [&](const std::string& name, int d0, int d1, Tensor& out) -> bool {
+        if (!safetensors_.has_tensor(name)) { fail("missing tensor: " + name); return false; }
+        out = safetensors_.get_tensor(name);
+        if (out.empty()) { fail("could not read tensor (unsupported dtype or empty): " + name); return false; }
+        if (d0 >= 0) {
+            const int dims = (d1 >= 0) ? 2 : 1;
+            const bool match = out.ndim() == dims && out.shape(0) == d0 && (d1 < 0 || out.shape(1) == d1);
+            if (!match) {
+                std::string got = "[";
+                for (int i = 0; i < out.ndim(); i++) got += (i ? ", " : "") + std::to_string(out.shape(i));
+                got += "]";
+                fail("unexpected shape for " + name + ": got " + got + ", expected [" + std::to_string(d0) +
+                     (d1 >= 0 ? ", " + std::to_string(d1) : std::string()) + "]");
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto copy_tensor = [&](std::vector<float>& dest, const std::string& name, int d0 = -1, int d1 = -1) {
+        Tensor t;
+        if (!fetch(name, d0, d1, t)) return;
         dest.assign(t.data(), t.data() + t.size());
     };
 
-    auto quantize_tensor = [&](Int8Tensor& dest, const std::string& name) {
-        if (!safetensors_.has_tensor(name)) return;
-        Tensor t = safetensors_.get_tensor(name);
+    auto quantize_tensor = [&](Int8Tensor& dest, const std::string& name, int d0 = -1, int d1 = -1) {
+        Tensor t;
+        if (!fetch(name, d0, d1, t)) return;
+        if (t.ndim() != 2) { fail("expected a 2-D weight matrix: " + name); return; }
         // Safetensors shape is [N, K], so M = N (output dim), K = K (input dim)
         ops::quantize_rowwise(dest, t.data(), t.shape(0), t.shape(1));
     };
 
-    copy_tensor(weights_.final_norm, "model.norm.weight");
+    // Qwen2 has q/k/v biases; if a checkpoint genuinely has none, use zeros instead of reading garbage
+    auto load_bias = [&](std::vector<float>& dest, const std::string& name, int n) {
+        if (!safetensors_.has_tensor(name)) { dest.assign(n, 0.0f); return; }
+        copy_tensor(dest, name, n);
+    };
+
+    copy_tensor(weights_.final_norm, "model.norm.weight", hidden);
 
     // Embedding table: keep an exact FP32 copy for token lookups. When tied,
     // quantize the same data once for the output projection instead of
     // keeping a second FP32 copy.
-    if (safetensors_.has_tensor("model.embed_tokens.weight")) {
-        Tensor t = safetensors_.get_tensor("model.embed_tokens.weight");
-        weights_.embed_tokens.assign(t.data(), t.data() + t.size());
-        if (config_.tie_word_embeddings) {
-            ops::quantize_rowwise(weights_.lm_head, t.data(), t.shape(0), t.shape(1));
+    {
+        Tensor t;
+        if (fetch("model.embed_tokens.weight", config_.vocab_size, hidden, t)) {
+            weights_.embed_tokens.assign(t.data(), t.data() + t.size());
+            if (config_.tie_word_embeddings) {
+                ops::quantize_rowwise(weights_.lm_head, t.data(), t.shape(0), t.shape(1));
+            }
         }
     }
     if (!config_.tie_word_embeddings) {
-        quantize_tensor(weights_.lm_head, "lm_head.weight");
+        quantize_tensor(weights_.lm_head, "lm_head.weight", config_.vocab_size, hidden);
     }
 
     for (int i = 0; i < config_.num_hidden_layers; i++) {
         std::string prefix = "model.layers." + std::to_string(i);
         LayerWeights& lw = weights_.layers[i];
 
-        quantize_tensor(lw.q_proj, prefix + ".self_attn.q_proj.weight");
-        copy_tensor(lw.q_proj_b, prefix + ".self_attn.q_proj.bias");
-        quantize_tensor(lw.k_proj, prefix + ".self_attn.k_proj.weight");
-        copy_tensor(lw.k_proj_b, prefix + ".self_attn.k_proj.bias");
-        quantize_tensor(lw.v_proj, prefix + ".self_attn.v_proj.weight");
-        copy_tensor(lw.v_proj_b, prefix + ".self_attn.v_proj.bias");
-        quantize_tensor(lw.o_proj, prefix + ".self_attn.o_proj.weight");
+        quantize_tensor(lw.q_proj, prefix + ".self_attn.q_proj.weight", q_dim, hidden);
+        load_bias(lw.q_proj_b, prefix + ".self_attn.q_proj.bias", q_dim);
+        quantize_tensor(lw.k_proj, prefix + ".self_attn.k_proj.weight", kv_dim, hidden);
+        load_bias(lw.k_proj_b, prefix + ".self_attn.k_proj.bias", kv_dim);
+        quantize_tensor(lw.v_proj, prefix + ".self_attn.v_proj.weight", kv_dim, hidden);
+        load_bias(lw.v_proj_b, prefix + ".self_attn.v_proj.bias", kv_dim);
+        quantize_tensor(lw.o_proj, prefix + ".self_attn.o_proj.weight", hidden, q_dim);
 
-        quantize_tensor(lw.gate_proj, prefix + ".mlp.gate_proj.weight");
-        quantize_tensor(lw.up_proj, prefix + ".mlp.up_proj.weight");
-        quantize_tensor(lw.down_proj, prefix + ".mlp.down_proj.weight");
+        quantize_tensor(lw.gate_proj, prefix + ".mlp.gate_proj.weight", inter, hidden);
+        quantize_tensor(lw.up_proj, prefix + ".mlp.up_proj.weight", inter, hidden);
+        quantize_tensor(lw.down_proj, prefix + ".mlp.down_proj.weight", hidden, inter);
 
-        copy_tensor(lw.input_layernorm_w, prefix + ".input_layernorm.weight");
-        copy_tensor(lw.post_attn_layernorm_w, prefix + ".post_attention_layernorm.weight");
+        copy_tensor(lw.input_layernorm_w, prefix + ".input_layernorm.weight", hidden);
+        copy_tensor(lw.post_attn_layernorm_w, prefix + ".post_attention_layernorm.weight", hidden);
     }
-    
-    // Free the FP32 buffers from memory!
-    safetensors_.clear();
+
+    // Everything has been copied or quantized: release the FP32 conversions and unmap the file.
+    safetensors_.close();
     stored_tensors_.clear();
+    return ok;
 }
 
 void Qwen2Model::allocate_buffers(int batch_size, int max_len, int max_total_len) {
@@ -163,6 +223,12 @@ void Qwen2Model::forward(const std::vector<int>& tokens, float* logits) {
 void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens, float* logits) {
     auto t_fwd0 = std::chrono::steady_clock::now();
     int batch_size = batch_tokens.size();
+    if (batch_size == 0) return;
+    if (batch_size > max_batch_size_) {
+        throw std::invalid_argument("forward_batch: batch size " + std::to_string(batch_size) +
+                                    " exceeds the model's max batch size " + std::to_string(max_batch_size_));
+    }
+    static const bool prof_on = std::getenv("VELOX_PROF") != nullptr;   // per-step timing summary on stderr
     static const bool dbg_on = std::getenv("VELOX_DEBUG_ACT") != nullptr;
     static int dbg_calls = 0;
     const bool dbg_now = dbg_on && (dbg_calls++ == 0);   // first call (prefill) only
@@ -187,10 +253,22 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
     for (int b = 0; b < batch_size; b++) {
         actual_lens[b] = batch_tokens[b].size();
         past_lens[b] = kv_caches_[b].seq_len;
-        
+        if (actual_lens[b] == 0) {
+            throw std::invalid_argument("forward_batch: empty token list for sequence " + std::to_string(b));
+        }
+        for (int tok : batch_tokens[b]) {
+            if (tok < 0 || tok >= config_.vocab_size) {
+                throw std::invalid_argument("forward_batch: token id " + std::to_string(tok) + " is outside the vocabulary");
+            }
+        }
+
+        // Refuse to run past the KV cache limit instead of overflowing the cache buffers
         int needed_len = past_lens[b] + actual_lens[b];
-        int cache_max = std::min(config_.max_position_embeddings, 4096);
-        if (needed_len > cache_max) needed_len = cache_max;
+        const int cache_max = max_context();
+        if (needed_len > cache_max) {
+            throw std::runtime_error("sequence length " + std::to_string(needed_len) +
+                                     " exceeds the KV cache limit of " + std::to_string(cache_max) + " tokens");
+        }
         kv_caches_[b].ensure_capacity(needed_len);
         
         max_len = std::max(max_len, actual_lens[b]);
@@ -363,10 +441,12 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         kv_caches_[b].seq_len = past_lens[b] + actual_lens[b];
     }
     auto t_fwd1 = std::chrono::steady_clock::now();
-    static double lm_ms = 0, fwd_ms = 0; static int n = 0;
-    lm_ms  += std::chrono::duration<double, std::milli>(t_lm1  - t_lm0 ).count();
-    fwd_ms += std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count();
-    if (++n % 32 == 0)
-        std::fprintf(stderr, "[prof] bs=%d  lm_head %.1f ms  forward %.1f ms  (%.0f%%)\n",
-                     batch_size, lm_ms / n, fwd_ms / n, 100.0 * lm_ms / fwd_ms);
+    if (prof_on) {
+        static double lm_ms = 0, fwd_ms = 0; static int n = 0;
+        lm_ms  += std::chrono::duration<double, std::milli>(t_lm1  - t_lm0 ).count();
+        fwd_ms += std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count();
+        if (++n % 32 == 0)
+            std::fprintf(stderr, "[prof] bs=%d  lm_head %.1f ms  forward %.1f ms  (%.0f%%)\n",
+                         batch_size, lm_ms / n, fwd_ms / n, 100.0 * lm_ms / fwd_ms);
+    }
 }
