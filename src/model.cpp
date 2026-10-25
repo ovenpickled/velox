@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 
 using json = nlohmann::json;
 
@@ -148,6 +149,29 @@ bool Qwen2Model::load_weights() {
         copy_tensor(dest, name, n);
     };
 
+    // Diagnostic: VELOX_FP32_LAYERS=all, or a comma-separated list such as 2,3,21, keeps FP32
+    // copies of those layers' weights and runs them without INT8 quantization.
+    std::vector<bool> fp32_flags(config_.num_hidden_layers, false);
+    if (const char* env = std::getenv("VELOX_FP32_LAYERS")) {
+        std::string spec(env);
+        try {
+            if (spec == "all") {
+                std::fill(fp32_flags.begin(), fp32_flags.end(), true);
+            } else {
+                std::stringstream ss(spec);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    int l = std::stoi(tok);
+                    if (l < 0 || l >= config_.num_hidden_layers) fail("VELOX_FP32_LAYERS: layer " + tok + " does not exist");
+                    else fp32_flags[l] = true;
+                }
+            }
+            std::cerr << "[diag] FP32 weights for layers: " << spec << std::endl;
+        } catch (const std::exception&) {
+            fail("VELOX_FP32_LAYERS: could not parse '" + spec + "' (use 'all' or e.g. '2,3,21')");
+        }
+    }
+
     copy_tensor(weights_.final_norm, "model.norm.weight", hidden);
 
     // Embedding table: keep an exact FP32 copy for token lookups. When tied,
@@ -184,6 +208,16 @@ bool Qwen2Model::load_weights() {
 
         copy_tensor(lw.input_layernorm_w, prefix + ".input_layernorm.weight", hidden);
         copy_tensor(lw.post_attn_layernorm_w, prefix + ".post_attention_layernorm.weight", hidden);
+
+        if (fp32_flags[i]) {
+            copy_tensor(lw.q_f32,    prefix + ".self_attn.q_proj.weight", q_dim, hidden);
+            copy_tensor(lw.k_f32,    prefix + ".self_attn.k_proj.weight", kv_dim, hidden);
+            copy_tensor(lw.v_f32,    prefix + ".self_attn.v_proj.weight", kv_dim, hidden);
+            copy_tensor(lw.o_f32,    prefix + ".self_attn.o_proj.weight", hidden, q_dim);
+            copy_tensor(lw.gate_f32, prefix + ".mlp.gate_proj.weight", inter, hidden);
+            copy_tensor(lw.up_f32,   prefix + ".mlp.up_proj.weight", inter, hidden);
+            copy_tensor(lw.down_f32, prefix + ".mlp.down_proj.weight", hidden, inter);
+        }
     }
 
     // Everything has been copied or quantized: release the FP32 conversions and unmap the file.
@@ -300,6 +334,12 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
     // --- Transformer Layers ---
     for (int layer = 0; layer < config_.num_hidden_layers; layer++) {
         LayerWeights& lw = weights_.layers[layer];
+        // Projection: FP32 weights if this layer was selected by VELOX_FP32_LAYERS, otherwise INT8
+        auto proj = [&](float* out, const float* in, const Int8Tensor& wq,
+                        const std::vector<float>& wf, int M_, int N_, int K_) {
+            if (!wf.empty()) ops::matmul(out, in, wf.data(), M_, N_, K_);
+            else             ops::matmul_w8a8(out, in, wq, M_, N_, K_);
+        };
 
         // Residual
         std::memcpy(residual_.data(), hidden_.data(), total_positions * hidden_size * sizeof(float));
@@ -313,9 +353,9 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         }
 
         // Q/K/V Projections (batched W8A8 matmul: M = total_positions)
-        ops::matmul_w8a8(q_buf_.data(), norm_out_.data(), lw.q_proj, total_positions, q_dim, hidden_size);
-        ops::matmul_w8a8(k_buf_.data(), norm_out_.data(), lw.k_proj, total_positions, kv_dim, hidden_size);
-        ops::matmul_w8a8(v_buf_.data(), norm_out_.data(), lw.v_proj, total_positions, kv_dim, hidden_size);
+        proj(q_buf_.data(), norm_out_.data(), lw.q_proj, lw.q_f32, total_positions, q_dim, hidden_size);
+        proj(k_buf_.data(), norm_out_.data(), lw.k_proj, lw.k_f32, total_positions, kv_dim, hidden_size);
+        proj(v_buf_.data(), norm_out_.data(), lw.v_proj, lw.v_f32, total_positions, kv_dim, hidden_size);
 
         // Bias (all positions)
         #pragma omp parallel for
@@ -391,7 +431,7 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         }
 
         // O Projection + Residual (batched W8A8 matmul)
-        ops::matmul_w8a8(hidden_.data(), attn_out_.data(), lw.o_proj, total_positions, hidden_size, q_dim);
+        proj(hidden_.data(), attn_out_.data(), lw.o_proj, lw.o_f32, total_positions, hidden_size, q_dim);
         ops::add(hidden_.data(), hidden_.data(), residual_.data(), total_positions * hidden_size);
 
         // FFN
@@ -404,8 +444,8 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                         lw.post_attn_layernorm_w.data(), hidden_size, config_.rms_norm_eps);
         }
 
-        ops::matmul_w8a8(ffn_gate_.data(), norm_out_.data(), lw.gate_proj, total_positions, intermediate_size, hidden_size);
-        ops::matmul_w8a8(ffn_up_.data(), norm_out_.data(), lw.up_proj, total_positions, intermediate_size, hidden_size);
+        proj(ffn_gate_.data(), norm_out_.data(), lw.gate_proj, lw.gate_f32, total_positions, intermediate_size, hidden_size);
+        proj(ffn_up_.data(), norm_out_.data(), lw.up_proj, lw.up_f32, total_positions, intermediate_size, hidden_size);
 
         ops::silu(ffn_gate_.data(), total_positions * intermediate_size);
         ops::multiply(ffn_gate_.data(), ffn_gate_.data(), ffn_up_.data(), total_positions * intermediate_size);
@@ -414,7 +454,7 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
             dbg_stats(layer, "down_in", ffn_gate_.data() + 0 * intermediate_size, intermediate_size, "pos0");
             dbg_stats(layer, "down_in", ffn_gate_.data() + last * intermediate_size, intermediate_size, "last");
         }
-        ops::matmul_w8a8(hidden_.data(), ffn_gate_.data(), lw.down_proj, total_positions, hidden_size, intermediate_size);
+        proj(hidden_.data(), ffn_gate_.data(), lw.down_proj, lw.down_f32, total_positions, hidden_size, intermediate_size);
 
         ops::add(hidden_.data(), hidden_.data(), residual_.data(), total_positions * hidden_size);
         if (dbg_now) {
@@ -433,7 +473,17 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                     weights_.final_norm.data(), hidden_size, config_.rms_norm_eps);
     }
     auto t_lm0 = std::chrono::steady_clock::now();
-    ops::matmul_w8a8(logits, norm_out_.data(), weights_.lm_head, batch_size, config_.vocab_size, config_.hidden_size);
+    // Diagnostic: VELOX_FP32_LMHEAD=1 uses the FP32 embedding table directly (tied models only)
+    static const bool fp32_lm_head = [this] {
+        bool on = std::getenv("VELOX_FP32_LMHEAD") != nullptr;
+        if (on && !config_.tie_word_embeddings)
+            std::cerr << "[diag] VELOX_FP32_LMHEAD ignored: this model does not tie its embeddings" << std::endl;
+        else if (on)
+            std::cerr << "[diag] FP32 LM head (tied embeddings)" << std::endl;
+        return on && config_.tie_word_embeddings;
+    }();
+    if (fp32_lm_head) ops::matmul(logits, norm_out_.data(), weights_.embed_tokens.data(), batch_size, config_.vocab_size, config_.hidden_size);
+    else              ops::matmul_w8a8(logits, norm_out_.data(), weights_.lm_head, batch_size, config_.vocab_size, config_.hidden_size);
     auto t_lm1 = std::chrono::steady_clock::now();
 
     // Update cache positions

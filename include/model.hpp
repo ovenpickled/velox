@@ -37,6 +37,10 @@ struct LayerWeights {
 
     std::vector<float> input_layernorm_w;
     std::vector<float> post_attn_layernorm_w;
+
+    // Diagnostic: FP32 copies of the projection weights for the layers selected with
+    // VELOX_FP32_LAYERS. Empty means "use the INT8 path".
+    std::vector<float> q_f32, k_f32, v_f32, o_f32, gate_f32, up_f32, down_f32;
 };
 
 struct ModelWeights {
