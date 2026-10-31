@@ -73,7 +73,11 @@ The last row is slower than the one above it at batch 1 on purpose: the earlier 
 
 Resident memory after loading is about 1.3 GB, of which 0.55 GB is the FP32 embedding table.
 
-### ![Roofline](docs/roofline.png)
+### Roofline
+![roofline](docs/roofline.png)
+Build:  g++ -O3 -march=native -fopenmp -o roofline_bench tools/roofline_bench.cpp -lm
+Run:    ./roofline_bench
+
 Measured on this machine: 25.8 GB/s read bandwidth (saturated by about 2 threads) and 271 GOP/s (4 threads) / 460 GOP/s (6 threads) for the autovectorised INT8 kernel. Batch-1 decode streams about 22 GB/s of weights, roughly 87% of the memory ceiling, so it is bandwidth-bound. Batch-8 decode reaches about 41% of its roof, so the INT8 kernel, not memory, is the limit there.
 
 ## Known limitations
