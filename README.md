@@ -49,15 +49,39 @@ A C++ inference engine for running Qwen2.5-style transformer models on CPU. It l
 
 ## Benchmarks
 
-> These numbers predate the output-dimension parallel matmuls and the INT8 LM head, so they are out of date. Re-run `./build/inference --model <dir> --benchmark` to refresh them.
-
-Measured on a Qwen2.5-0.5B model, 15 repetitions per batch size, median ± standard deviation:
+Qwen2.5-0.5B on an AMD Ryzen 5 220 (6 cores / 12 threads), 1-token prompt, 64 greedy-decoded tokens, mean ± std over the benchmark's repetitions. INT8 weights, INT8 activations in groups of 128, the 7 outlier-sensitive matrices in FP32 (load-time protection). `OMP_NUM_THREADS=6 OMP_PROC_BIND=close OMP_PLACES=cores`.
 
 | Batch Size | TTFT (ms) | Per-Seq Speed (tok/s) | Aggregate Throughput (tok/s) |
-|------------|-----------|------------------------|-------------------------------|
-| 1 | 236 ± 151 | 3.34 ± 0.25 | 3.34 ± 0.25 |
-| 2 | 440 ± 225 | 2.06 ± 0.09 | 4.13 ± 0.19 |
-| 4 | 849 ± 143 | 1.44 ± 0.08 | 5.74 ± 0.32 |
-| 8 | 1855 ± 207 | 0.74 ± 0.00 | 5.94 ± 0.03 |
+|------------|-----------|-----------------------|------------------------------|
+| 1          | 24±1      | 38.25±0.49            | 38.25±0.49                   |
+| 2          | 26±1      | 36.93±0.12            | 73.86±0.25                   |
+| 4          | 29±1      | 32.27±0.19            | 129.10±0.75                  |
+| 8          | 51±5      | 18.03±0.80            | 144.21±6.43                  |
 
-Time to First Token (TTFT) is a single point-in-time measurement, so it's noisy on virtualized environments like WSL2 - a stolen CPU core can spike one run without affecting the trend. Aggregate throughput averages over many decode steps, so it stays stable even with fewer repetitions. Run 15+ repetitions if you need a reliable TTFT median.
+Batch-1 decode is memory-bound and gains nothing beyond about 4 threads; batch 8 is compute-bound and benefits from 6. Run-to-run and session-to-session variation on this laptop is roughly 5–10%.
+
+### Optimisation history (decode, tok/s)
+
+| Stage | Batch 1 | Batch 8 (aggregate) |
+|-------|---------|---------------------|
+| Original | 9.5 | 11.0 |
+| Matmuls parallel over the output dimension | 25.6 | 128 |
+| INT8 LM head (no activation groups, no protection) | 43.5 | 145 |
+| + group-wise activation scales + FP32 protection (final) | 38.3 | 144 |
+
+The last row is slower than the one above it at batch 1 on purpose: the earlier version produced wrong answers for single-token prompts (mean logit error about 1.2 versus about 0.14 now). Earlier rows are single 64-token runs, the last is the benchmark mean, so small differences between rows are within noise.
+
+Resident memory after loading is about 1.3 GB, of which 0.55 GB is the FP32 embedding table.
+
+### ![Roofline](docs/roofline.png)
+Measured on this machine: 25.8 GB/s read bandwidth (saturated by about 2 threads) and 271 GOP/s (4 threads) / 460 GOP/s (6 threads) for the autovectorised INT8 kernel. Batch-1 decode streams about 22 GB/s of weights, roughly 87% of the memory ceiling, so it is bandwidth-bound. Batch-8 decode reaches about 41% of its roof, so the INT8 kernel, not memory, is the limit there.
+
+## Known limitations
+
+- The batch-8 INT8 kernel reaches about 41% of its compute roof. A hand-written grouped kernel (VNNI intrinsics) is the obvious next step; the autovectoriser cannot produce one.
+- Protecting whole matrices costs about 12% of batch-1 decode speed. Protecting only the outlier input columns would recover most of it.
+- The embedding table is stored as FP32 (0.55 GB) alongside the INT8 LM head. Storing it as BF16 would halve it, exactly for BF16 checkpoints.
+- Load-time protection calibrates with a single token (id 0) and assumes the first-token massive-activation pattern; disable with `VELOX_NO_AUTO_FP32=1`.
+- Batching is static: sequences that finish early keep computing until the batch ends.
+- Context is limited to 4096 tokens.
+- The tokenizer matches Hugging Face on 25 test strings and a 100,000-string fuzz test against the reference regex (Unicode 15 tables); it has not been checked beyond that.

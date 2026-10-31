@@ -13,6 +13,7 @@
 #include <string>
 #include <sstream>
 #include <set>
+#include <malloc.h>
 
 using json = nlohmann::json;
 
@@ -262,9 +263,32 @@ bool Qwen2Model::load_weights() {
         }
     }
 
+    // A matrix that runs in FP32 never uses its INT8 copy: release it
+    auto drop_int8 = [](Int8Tensor& t) {
+        std::vector<int8_t>().swap(t.data);
+        std::vector<float>().swap(t.scales);
+    };
+    for (auto& lw : weights_.layers) {
+        if (!lw.q_f32.empty())    drop_int8(lw.q_proj);
+        if (!lw.k_f32.empty())    drop_int8(lw.k_proj);
+        if (!lw.v_f32.empty())    drop_int8(lw.v_proj);
+        if (!lw.o_f32.empty())    drop_int8(lw.o_proj);
+        if (!lw.gate_f32.empty()) drop_int8(lw.gate_proj);
+        if (!lw.up_f32.empty())   drop_int8(lw.up_proj);
+        if (!lw.down_f32.empty()) drop_int8(lw.down_proj);
+    }
+
     // Everything has been copied or quantized: release the FP32 conversions and unmap the file.
     safetensors_.close();
     stored_tensors_.clear();
+    #ifdef __GLIBC__
+        malloc_trim(0);   // return freed load-time memory to the OS so RSS reflects the real footprint
+    #endif
+    if (std::getenv("VELOX_PROF")) {
+        long pages = 0, total = 0;
+        if (FILE* f = fopen("/proc/self/statm", "r")) { if (fscanf(f, "%ld %ld", &total, &pages) != 2) pages = 0; fclose(f); }
+        std::cerr << "[load] resident after load: " << pages * 4096 / (1024 * 1024) << " MB" << std::endl;
+    }
     return ok;
 }
 

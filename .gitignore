@@ -25,3 +25,11 @@ models/
 # OS
 .DS_Store
 Thumbs.db
+build/
+scripts/__pycache__/
+roofline_bench
+*.bin
+build/
+scripts/__pycache__/
+roofline_bench
+*.bin

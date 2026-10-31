@@ -36,7 +36,7 @@ void quantize_rowwise(Int8Tensor& out, const float* weights, int M, int K) {
 }
 
 #ifndef ACT_GROUP
-#define ACT_GROUP 64
+#define ACT_GROUP 128
 #endif
 
 // Diagnostic only: INT8 weights, FP32 activations (no activation quantization)
@@ -174,12 +174,14 @@ void rope(float* q, float* k, int head_dim, int num_q_heads, int num_kv_heads, i
 }
 
 void silu(float* x, int size) {
+    #pragma omp parallel for schedule(static) if(size >= 16384)
     for (int i = 0; i < size; ++i) {
         x[i] = x[i] / (1.0f + std::exp(-x[i]));
     }
 }
 
 void multiply(float* out, const float* a, const float* b, int size) {
+    #pragma omp parallel for schedule(static) if(size >= 16384)
     for (int i = 0; i < size; ++i) {
         out[i] = a[i] * b[i];
     }
