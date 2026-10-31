@@ -1,0 +1,39 @@
+Roofline Benchmark — 4 threads (OMP_NUM_THREADS=4)
+
+=== STREAM Bandwidth (N = 8388608 doubles, 64.0 MiB per array) ===
+  Copy        14.92 GB/s  (min:  9.62, max: 17.53)
+  Scale       16.07 GB/s  (min: 13.04, max: 18.98)
+  Add         21.67 GB/s  (min: 16.86, max: 22.61)
+  Triad       20.70 GB/s  (min: 15.49, max: 22.46)
+  -------
+  Best:      20.70 GB/s (Triad)
+
+=== Read-Only Bandwidth ===
+  Read-only:    23.92 GB/s  (min: 21.01, max: 25.85)
+
+=== Peak FP32 Throughput ===
+  FP32 vector FMA:  388.15 GFLOP/s
+
+=== Peak INT8 Throughput ===
+  INT8 compute (in-cache, this kernel):  270.99 GOP/s
+
+=== LM Head Effective Bandwidth (M=1, N=151936, K=896) ===
+  Achieved:     23.63 GB/s
+  Weight data: 129.8 MiB (INT8)
+
+=== Roofline Summary ===
+  Peak bandwidth:  23.92 GB/s
+  Peak INT8:       270.99 GOP/s
+  Peak FP32:       388.15 GFLOP/s
+  INT8 ridge:      11.33 OP/byte
+  FP32 ridge:      16.23 FLOP/byte
+
+  --- Operational Intensity for decode ---
+  INT8 weights, batch 1      OI   2.0  ridge   11.3  attainable    47.8 GOP/s  MEMORY-bound
+  INT8 weights, batch 8      OI  16.0  ridge   11.3  attainable   271.0 GOP/s  COMPUTE-bound
+  FP32 weights, batch 1      OI   0.5  ridge   16.2  attainable    12.0 GOP/s  MEMORY-bound
+  FP32 weights, batch 8      OI   4.0  ridge   16.2  attainable    95.7 GOP/s  MEMORY-bound
+
+CSV,mem_best_gbs,23.92
+CSV,peak_int8_gops,270.99
+CSV,peak_fp32_gflops,388.15

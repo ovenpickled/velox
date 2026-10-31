@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <sstream>
+#include <set>
 
 using json = nlohmann::json;
 
@@ -71,18 +72,18 @@ bool Qwen2Model::load(const std::string& model_dir, int max_batch_size) {
         return false;
     }
 
-    if (!load_weights()) {
-        std::cerr << "Failed to load model weights from " << model_dir << std::endl;
-        return false;
-    }
-
     max_batch_size_ = max_batch_size;
     kv_caches_.resize(max_batch_size);
     for (int b = 0; b < max_batch_size; b++) {
         kv_caches_[b].init(config_.num_hidden_layers, config_.num_key_value_heads, config_.head_dim, 128);
     }
-
     allocate_buffers(1, 1, 1);
+
+    if (!load_weights()) {
+        std::cerr << "Failed to load model weights from " << model_dir << std::endl;
+        return false;
+    }
+
     return true;
 }
 
@@ -172,6 +173,18 @@ bool Qwen2Model::load_weights() {
         }
     }
 
+    std::set<std::string> fp32_proj;   // empty = all seven projections
+    if (const char* env = std::getenv("VELOX_FP32_PROJ")) {
+        std::stringstream ss{std::string(env)};
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (tok == "q" || tok == "k" || tok == "v" || tok == "o" ||
+                tok == "gate" || tok == "up" || tok == "down") fp32_proj.insert(tok);
+            else fail("VELOX_FP32_PROJ: unknown projection '" + tok + "' (use q,k,v,o,gate,up,down)");
+        }
+        std::cerr << "[diag] FP32 projections: " << env << std::endl;
+    }
+
     copy_tensor(weights_.final_norm, "model.norm.weight", hidden);
 
     // Embedding table: keep an exact FP32 copy for token lookups. When tied,
@@ -210,13 +223,42 @@ bool Qwen2Model::load_weights() {
         copy_tensor(lw.post_attn_layernorm_w, prefix + ".post_attention_layernorm.weight", hidden);
 
         if (fp32_flags[i]) {
-            copy_tensor(lw.q_f32,    prefix + ".self_attn.q_proj.weight", q_dim, hidden);
-            copy_tensor(lw.k_f32,    prefix + ".self_attn.k_proj.weight", kv_dim, hidden);
-            copy_tensor(lw.v_f32,    prefix + ".self_attn.v_proj.weight", kv_dim, hidden);
-            copy_tensor(lw.o_f32,    prefix + ".self_attn.o_proj.weight", hidden, q_dim);
-            copy_tensor(lw.gate_f32, prefix + ".mlp.gate_proj.weight", inter, hidden);
-            copy_tensor(lw.up_f32,   prefix + ".mlp.up_proj.weight", inter, hidden);
-            copy_tensor(lw.down_f32, prefix + ".mlp.down_proj.weight", hidden, inter);
+            auto want = [&](const char* n) { return fp32_proj.empty() || fp32_proj.count(n) > 0; };
+            if (want("q"))    copy_tensor(lw.q_f32,    prefix + ".self_attn.q_proj.weight", q_dim, hidden);
+            if (want("k"))    copy_tensor(lw.k_f32,    prefix + ".self_attn.k_proj.weight", kv_dim, hidden);
+            if (want("v"))    copy_tensor(lw.v_f32,    prefix + ".self_attn.v_proj.weight", kv_dim, hidden);
+            if (want("o"))    copy_tensor(lw.o_f32,    prefix + ".self_attn.o_proj.weight", hidden, q_dim);
+            if (want("gate")) copy_tensor(lw.gate_f32, prefix + ".mlp.gate_proj.weight", inter, hidden);
+            if (want("up"))   copy_tensor(lw.up_f32,   prefix + ".mlp.up_proj.weight", inter, hidden);
+            if (want("down")) copy_tensor(lw.down_f32, prefix + ".mlp.down_proj.weight", hidden, inter);
+        }
+    }
+
+    if (ok && !std::getenv("VELOX_NO_AUTO_FP32")) {
+        // Calibration: the first token of every sequence carries "massive activations" (|x| ~ 1000 on a
+        // few channels) that INT8 weights cannot represent. Find the MLP matrices that see them.
+        const float kOutlier = 100.0f;
+        calib_ffn_max_.assign(config_.num_hidden_layers, 0.0f);
+        calib_down_max_.assign(config_.num_hidden_layers, 0.0f);
+        std::vector<std::vector<int>> calib_tokens(1, std::vector<int>(1, 0));
+        std::vector<float> calib_logits(config_.vocab_size);
+        calibrating_ = true;
+        forward_batch(calib_tokens, calib_logits.data());
+        calibrating_ = false;
+        kv_caches_[0].seq_len = 0;
+
+        for (int i = 0; i < config_.num_hidden_layers; i++) {
+            LayerWeights& lw = weights_.layers[i];
+            std::string prefix = "model.layers." + std::to_string(i);
+            if (calib_ffn_max_[i] > kOutlier && lw.gate_f32.empty()) {
+                copy_tensor(lw.gate_f32, prefix + ".mlp.gate_proj.weight", inter, hidden);
+                copy_tensor(lw.up_f32,   prefix + ".mlp.up_proj.weight", inter, hidden);
+                std::cerr << "[load] layer " << i << ": gate/up kept in FP32 (ffn input max " << calib_ffn_max_[i] << ")" << std::endl;
+            }
+            if (calib_down_max_[i] > kOutlier && lw.down_f32.empty()) {
+                copy_tensor(lw.down_f32, prefix + ".mlp.down_proj.weight", hidden, inter);
+                std::cerr << "[load] layer " << i << ": down kept in FP32 (down input max " << calib_down_max_[i] << ")" << std::endl;
+            }
         }
     }
 
@@ -271,12 +313,16 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
 
     // Per-component accumulators for detailed profiling (VELOX_PROF=2)
     using DurMS = std::chrono::duration<double, std::milli>;
-    double prof_norm_ms = 0, prof_qkv_ms = 0, prof_rope_bias_ms = 0;
-    double prof_attn_ms = 0, prof_oproj_ms = 0;
-    double prof_ffn_norm_ms = 0, prof_ffn_proj_ms = 0, prof_ffn_act_ms = 0;
+    static double prof_norm_ms = 0, prof_qkv_ms = 0, prof_rope_bias_ms = 0;
+    static double prof_attn_ms = 0, prof_oproj_ms = 0;
+    static double prof_ffn_norm_ms = 0, prof_ffn_proj_ms = 0, prof_ffn_act_ms = 0;
+    static int prof_steps = 0;
+    static int prof_calls = 0;
+    const bool is_prefill = (!calibrating_ && prof_calls++ == 0);
+    const bool prof_detail_on = (prof_detail && !is_prefill && !calibrating_);
     auto tick = [&]{ return std::chrono::steady_clock::now(); };
     static int dbg_calls = 0;
-    const bool dbg_now = dbg_on && (dbg_calls++ == 0);   // first call (prefill) only
+    const bool dbg_now = (!calibrating_ && dbg_on && (dbg_calls++ == 0));   // first call (prefill) only
     auto dbg_stats = [&](int layer, const char* name, const float* x, int n, const char* where) {
         float mx = 0, sum = 0; int arg = 0;
         for (int i = 0; i < n; i++) {
@@ -342,6 +388,8 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         }
     }
 
+    auto max_abs = [](const float* x, int n) { float m = 0.0f; for (int i = 0; i < n; i++) m = std::max(m, std::fabs(x[i])); return m; };
+
     // --- Transformer Layers ---
     for (int layer = 0; layer < config_.num_hidden_layers; layer++) {
         LayerWeights& lw = weights_.layers[layer];
@@ -356,19 +404,30 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         std::memcpy(residual_.data(), hidden_.data(), total_positions * hidden_size * sizeof(float));
 
         // Input LayerNorm (all positions including padding — zero input produces zero output)
+        auto t_norm = tick();
         #pragma omp parallel for
         for (int p = 0; p < total_positions; p++) {
             ops::rmsnorm(norm_out_.data() + p * hidden_size,
                         hidden_.data() + p * hidden_size,
                         lw.input_layernorm_w.data(), hidden_size, config_.rms_norm_eps);
         }
+        if (prof_detail_on) prof_norm_ms += DurMS(tick() - t_norm).count();
+
+        if (dbg_now) {
+            int last = actual_lens[0] - 1;
+            dbg_stats(layer, "attn_in", norm_out_.data() + 0 * hidden_size, hidden_size, "pos0");
+            dbg_stats(layer, "attn_in", norm_out_.data() + last * hidden_size, hidden_size, "last");
+        }
 
         // Q/K/V Projections (batched W8A8 matmul: M = total_positions)
+        auto t_qkv = tick();
         proj(q_buf_.data(), norm_out_.data(), lw.q_proj, lw.q_f32, total_positions, q_dim, hidden_size);
         proj(k_buf_.data(), norm_out_.data(), lw.k_proj, lw.k_f32, total_positions, kv_dim, hidden_size);
         proj(v_buf_.data(), norm_out_.data(), lw.v_proj, lw.v_f32, total_positions, kv_dim, hidden_size);
+        if (prof_detail_on) prof_qkv_ms += DurMS(tick() - t_qkv).count();
 
         // Bias (all positions)
+        auto t_rope_bias = tick();
         #pragma omp parallel for
         for (int p = 0; p < total_positions; p++) {
             ops::add_bias(q_buf_.data() + p * q_dim, lw.q_proj_b.data(), q_dim);
@@ -398,8 +457,10 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                        v_buf_.data() + b * max_len * kv_dim,
                        actual_lens[b] * kv_dim * sizeof(float));
         }
+        if (prof_detail_on) prof_rope_bias_ms += DurMS(tick() - t_rope_bias).count();
 
         // Attention (per-sequence — different cache lengths)
+        auto t_attn = tick();
         #pragma omp parallel for collapse(2) if(static_cast<size_t>(batch_size) * num_heads >= 16)
         for (int b = 0; b < batch_size; b++) {
             for (int h = 0; h < num_heads; h++) {
@@ -440,32 +501,58 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                 }
             }
         }
+        if (prof_detail_on) prof_attn_ms += DurMS(tick() - t_attn).count();
+
+        if (dbg_now) {
+            int last = actual_lens[0] - 1;
+            dbg_stats(layer, "o_in", attn_out_.data() + 0 * q_dim, q_dim, "pos0");
+            dbg_stats(layer, "o_in", attn_out_.data() + last * q_dim, q_dim, "last");
+        }
 
         // O Projection + Residual (batched W8A8 matmul)
+        auto t_oproj = tick();
         proj(hidden_.data(), attn_out_.data(), lw.o_proj, lw.o_f32, total_positions, hidden_size, q_dim);
         ops::add(hidden_.data(), hidden_.data(), residual_.data(), total_positions * hidden_size);
+        if (prof_detail_on) prof_oproj_ms += DurMS(tick() - t_oproj).count();
 
         // FFN
         std::memcpy(residual_.data(), hidden_.data(), total_positions * hidden_size * sizeof(float));
 
+        auto t_ffn_norm = tick();
         #pragma omp parallel for
         for (int p = 0; p < total_positions; p++) {
             ops::rmsnorm(norm_out_.data() + p * hidden_size,
                         hidden_.data() + p * hidden_size,
                         lw.post_attn_layernorm_w.data(), hidden_size, config_.rms_norm_eps);
         }
+        if (prof_detail_on) prof_ffn_norm_ms += DurMS(tick() - t_ffn_norm).count();
 
+        if (dbg_now) {
+            int last = actual_lens[0] - 1;
+            dbg_stats(layer, "ffn_in", norm_out_.data() + 0 * hidden_size, hidden_size, "pos0");
+            dbg_stats(layer, "ffn_in", norm_out_.data() + last * hidden_size, hidden_size, "last");
+        }
+        if (calibrating_) calib_ffn_max_[layer] = max_abs(norm_out_.data(), hidden_size);   // position 0 of sequence 0
+
+        auto t_ffn_proj = tick();
         proj(ffn_gate_.data(), norm_out_.data(), lw.gate_proj, lw.gate_f32, total_positions, intermediate_size, hidden_size);
         proj(ffn_up_.data(), norm_out_.data(), lw.up_proj, lw.up_f32, total_positions, intermediate_size, hidden_size);
+        if (prof_detail_on) prof_ffn_proj_ms += DurMS(tick() - t_ffn_proj).count();
 
+        auto t_ffn_act = tick();
         ops::silu(ffn_gate_.data(), total_positions * intermediate_size);
         ops::multiply(ffn_gate_.data(), ffn_gate_.data(), ffn_up_.data(), total_positions * intermediate_size);
+        if (prof_detail_on) prof_ffn_act_ms += DurMS(tick() - t_ffn_act).count();
+
         if (dbg_now) {
             int last = actual_lens[0] - 1;
             dbg_stats(layer, "down_in", ffn_gate_.data() + 0 * intermediate_size, intermediate_size, "pos0");
             dbg_stats(layer, "down_in", ffn_gate_.data() + last * intermediate_size, intermediate_size, "last");
         }
+        if (calibrating_) calib_down_max_[layer] = max_abs(ffn_gate_.data(), intermediate_size);
+        auto t_down = tick();
         proj(hidden_.data(), ffn_gate_.data(), lw.down_proj, lw.down_f32, total_positions, hidden_size, intermediate_size);
+        if (prof_detail_on) prof_ffn_proj_ms += DurMS(tick() - t_down).count();
 
         ops::add(hidden_.data(), hidden_.data(), residual_.data(), total_positions * hidden_size);
         if (dbg_now) {
@@ -502,12 +589,29 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         kv_caches_[b].seq_len = past_lens[b] + actual_lens[b];
     }
     auto t_fwd1 = std::chrono::steady_clock::now();
-    if (prof_on) {
+    if (prof_on && !calibrating_) {
         static double lm_ms = 0, fwd_ms = 0; static int n = 0;
         lm_ms  += std::chrono::duration<double, std::milli>(t_lm1  - t_lm0 ).count();
         fwd_ms += std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count();
-        if (++n % 32 == 0)
+        if (prof_detail_on) {
+            prof_steps++;
+        }
+        if (++n % 32 == 0) {
             std::fprintf(stderr, "[prof] bs=%d  lm_head %.1f ms  forward %.1f ms  (%.0f%%)\n",
                          batch_size, lm_ms / n, fwd_ms / n, 100.0 * lm_ms / fwd_ms);
+            if (prof_detail && prof_steps > 0) {
+                double total = prof_norm_ms + prof_qkv_ms + prof_rope_bias_ms + prof_attn_ms +
+                               prof_oproj_ms + prof_ffn_norm_ms + prof_ffn_proj_ms + prof_ffn_act_ms;
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "input_norm",   prof_norm_ms / prof_steps,      100.0 * prof_norm_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "qkv_proj",     prof_qkv_ms / prof_steps,       100.0 * prof_qkv_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "rope_bias",    prof_rope_bias_ms / prof_steps, 100.0 * prof_rope_bias_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "attn",         prof_attn_ms / prof_steps,       100.0 * prof_attn_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "o_proj",       prof_oproj_ms / prof_steps,      100.0 * prof_oproj_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "ffn_norm",     prof_ffn_norm_ms / prof_steps,   100.0 * prof_ffn_norm_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "ffn_proj",     prof_ffn_proj_ms / prof_steps,   100.0 * prof_ffn_proj_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (%4.1f%%)\n", "ffn_act",      prof_ffn_act_ms / prof_steps,    100.0 * prof_ffn_act_ms / total);
+                std::fprintf(stderr, "  %-14s %6.2f ms  (layers total)\n", "layers",   total / prof_steps);
+            }
+        }
     }
 }

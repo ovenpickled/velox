@@ -129,6 +129,10 @@ private:
 
     std::vector<Tensor> stored_tensors_;
 
+    // Load-time calibration (see load_weights): per-layer first-token activation maxima
+    bool calibrating_ = false;
+    std::vector<float> calib_ffn_max_, calib_down_max_;
+
     void allocate_buffers(int batch_size, int max_len, int max_total_len);
     bool load_weights();
 };

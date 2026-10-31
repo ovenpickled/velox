@@ -5,9 +5,9 @@
 // Run:    ./roofline_bench
 //
 // Measures:
-//   1. Memory bandwidth (STREAM-style Copy, Scale, Add, Triad)
-//   2. Peak FP32 throughput (FMA-dominated loop)
-//   3. Peak INT8 dot-product throughput (simulates W8A8 inner loop)
+//   1. Memory bandwidth (STREAM-style Copy, Scale, Add, Triad, and Read-only)
+//   2. Peak FP32 throughput (vector FMA)
+//   3. Peak INT8 dot-product throughput (in-cache compute ceiling)
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +41,7 @@ static double now_sec() {
 // Uses arrays large enough to exceed L3 cache.  Each kernel is run
 // `reps` times; we take the median bandwidth.
 
-static void stream_benchmark(size_t n_elements, int reps) {
+static double stream_benchmark(size_t n_elements, int reps) {
     // Allocate aligned arrays
     std::vector<double> a(n_elements), b(n_elements), c(n_elements);
 
@@ -62,10 +62,12 @@ static void stream_benchmark(size_t n_elements, int reps) {
             fn();
             double t1 = now_sec();
             double bytes = (double)n_elements * bytes_per_elem;
-            bws.push_back(bytes / (t1 - t0));
+            bws.push_back(bytes / (t1 - t0) / 1e9);
         }
-        double med = median(bws) / 1e9;
-        printf("  %-8s  %7.2f GB/s\n", name, med);
+        double med = median(bws);
+        double mn = *std::min_element(bws.begin(), bws.end());
+        double mx = *std::max_element(bws.begin(), bws.end());
+        printf("  %-8s  %7.2f GB/s  (min: %5.2f, max: %5.2f)\n", name, med, mn, mx);
         return med;
     };
 
@@ -95,108 +97,195 @@ static void stream_benchmark(size_t n_elements, int reps) {
     printf("  -------\n");
     printf("  Best:    %7.2f GB/s (Triad)\n", bw_triad);
     printf("\n");
+    return bw_triad;
 }
 
 // ---------------------------------------------------------------------------
-// 2. Peak FP32 arithmetic throughput (FMA chains)
+// Read-only bandwidth benchmark
 // ---------------------------------------------------------------------------
-// Each thread runs independent FMA chains to saturate FP execution units.
-// We use multiple accumulators to avoid latency bottlenecks.
-
-static void fp32_throughput_benchmark(int reps) {
-    int nthreads = omp_get_max_threads();
-    // Each iteration does 16 FMAs (a = a * b + c counts as 2 FLOPs)
-    const long iters = 100000000L;
-
-    printf("=== Peak FP32 Throughput (%d threads, %ld iterations/thread) ===\n", nthreads, iters);
-
-    std::vector<double> gflops_list;
+static double read_bandwidth_benchmark(size_t n_floats, int reps) {   // e.g. 64M uint32_t = 256 MiB
+    std::vector<uint32_t> data(n_floats);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n_floats; i++) data[i] = 1u;
+    std::vector<double> bws;
+    volatile uint32_t sink = 0;
     for (int r = 0; r < reps; r++) {
-        volatile float sink = 0;  // prevent dead-code elimination
+        uint32_t total = 0u;
         double t0 = now_sec();
+        #pragma omp parallel for simd schedule(static) reduction(+:total)
+        for (size_t i = 0; i < n_floats; i++) total += data[i];
+        double t1 = now_sec();
+        sink += total;
+        bws.push_back((double)n_floats * 4 / (t1 - t0) / 1e9);
+    }
+    double med = median(bws);
+    double mn = *std::min_element(bws.begin(), bws.end());
+    double mx = *std::max_element(bws.begin(), bws.end());
+    printf("  Read-only:  %7.2f GB/s  (min: %5.2f, max: %5.2f)\n", med, mn, mx);
+    return med;
+}
 
+// ---------------------------------------------------------------------------
+// 2. Peak FP32 arithmetic throughput (vector FMA)
+// ---------------------------------------------------------------------------
+static double fp32_vector_benchmark(int reps) {
+    const long ITERS = 20000000L;
+    const int nthreads = omp_get_max_threads();
+    volatile float sink = 0;
+    std::vector<double> gflops;
+    for (int r = 0; r < reps; r++) {
+        double t0 = now_sec();
         #pragma omp parallel
         {
-            // 8 independent FMA accumulators to hide latency
-            float a0 = 1.0001f, a1 = 1.0002f, a2 = 1.0003f, a3 = 1.0004f;
-            float a4 = 1.0005f, a5 = 1.0006f, a6 = 1.0007f, a7 = 1.0008f;
-            float b = 1.000001f, c = 0.000001f;
-
-            for (long i = 0; i < iters; i++) {
-                a0 = a0 * b + c;  a1 = a1 * b + c;
-                a2 = a2 * b + c;  a3 = a3 * b + c;
-                a4 = a4 * b + c;  a5 = a5 * b + c;
-                a6 = a6 * b + c;  a7 = a7 * b + c;
-            }
-            // Use the results so the compiler can't optimize them away
-            float s = a0+a1+a2+a3+a4+a5+a6+a7;
-            #pragma omp atomic
+            alignas(64) float acc[8][16];                 // 8 independent chains of 16 floats
+            for (int i = 0; i < 8; i++) for (int l = 0; l < 16; l++) acc[i][l] = 1.0f + 0.001f * (i * 16 + l);
+            const float b = 1.0000001f, c = 1e-7f;
+            for (long it = 0; it < ITERS; it++)
+                for (int i = 0; i < 8; i++) {
+                    #pragma omp simd
+                    for (int l = 0; l < 16; l++) acc[i][l] = __builtin_fmaf(acc[i][l], b, c);
+                }
+            float s = 0;
+            for (int i = 0; i < 8; i++) for (int l = 0; l < 16; l++) s += acc[i][l];
+            #pragma omp critical
             sink += s;
         }
-
         double t1 = now_sec();
-        // 8 FMAs per iteration, 2 FLOPs per FMA = 16 FLOPs/iter
-        double flops = (double)nthreads * iters * 8.0 * 2.0;
-        gflops_list.push_back(flops / (t1 - t0) / 1e9);
+        gflops.push_back((double)nthreads * ITERS * 8 * 16 * 2.0 / (t1 - t0) / 1e9);
     }
-
-    double med = median(gflops_list);
-    printf("  Scalar FMA:  %7.2f GFLOP/s\n", med);
-    printf("\n");
+    double med = median(gflops);
+    printf("  FP32 vector FMA: %7.2f GFLOP/s\n", med);
+    return med;
 }
 
 // ---------------------------------------------------------------------------
-// 3. Peak INT8 dot product throughput
+// 3. Peak INT8 compute throughput (in-cache)
 // ---------------------------------------------------------------------------
-// Simulates the W8A8 inner kernel: int8×int8 → int32 accumulate.
-// This is what the matmul_w8a8 inner loop does.
-
-static void int8_throughput_benchmark(int reps) {
-    int nthreads = omp_get_max_threads();
-    // Simulate dot products of length K=896 (Qwen2.5-0.5B hidden size)
-    const int K = 896;
-    const int num_dots = 200000;
-
-    printf("=== INT8 Dot Product Throughput (%d threads, %d dots × K=%d) ===\n",
-           nthreads, num_dots, K);
-
-    // Prepare data
-    std::vector<int8_t> a_data(K * num_dots), b_data(K * num_dots);
-    for (size_t i = 0; i < a_data.size(); i++) {
-        a_data[i] = (int8_t)((i * 7 + 3) % 255 - 127);
-        b_data[i] = (int8_t)((i * 11 + 5) % 255 - 127);
-    }
-    std::vector<int32_t> results(num_dots);
-
-    std::vector<double> gops_list;
+static double int8_compute_benchmark(int reps) {
+    const int K = 896, ROWS = 16;          // 16 x 896 B = 14 KB of weights per thread: stays in L1
+    const long REPEAT = 400000;            // tune so one repetition takes at least ~0.2 s
+    const int nthreads = omp_get_max_threads();
+    volatile int32_t sink = 0;
+    std::vector<double> gops;
     for (int r = 0; r < reps; r++) {
         double t0 = now_sec();
-
-        #pragma omp parallel for schedule(static)
-        for (int d = 0; d < num_dots; d++) {
-            const int8_t* pa = a_data.data() + (size_t)d * K;
-            const int8_t* pb = b_data.data() + (size_t)d * K;
-            int32_t s = 0;
-            for (int k = 0; k < K; k++) {
-                s += (int32_t)pa[k] * (int32_t)pb[k];
+        #pragma omp parallel
+        {
+            std::vector<int8_t> w(ROWS * K), a(K);
+            for (int i = 0; i < ROWS * K; i++) w[i] = (int8_t)((i * 7 + 3) % 251 - 125);
+            for (int i = 0; i < K; i++)        a[i] = (int8_t)((i * 11 + 5) % 251 - 125);
+            int32_t total = 0;
+            for (long rep = 0; rep < REPEAT; rep++) {
+                int32_t round_sum = 0;
+                for (int row = 0; row < ROWS; row++) {
+                    const int8_t* pw = w.data() + (size_t)row * K;
+                    int32_t s = 0;
+                    for (int k = 0; k < K; k++) s += (int32_t)a[k] * (int32_t)pw[k];
+                    round_sum += s;
+                }
+                a[0] = (int8_t)(round_sum & 0x3f);   // dependency on the previous round: stops the compiler hoisting the work
+                total += round_sum;
             }
-            results[d] = s;
+            #pragma omp critical
+            sink += total;
         }
-
         double t1 = now_sec();
-        // 2 ops per multiply-accumulate (mul + add)
-        double ops = (double)num_dots * K * 2.0;
-        gops_list.push_back(ops / (t1 - t0) / 1e9);
+        gops.push_back((double)nthreads * REPEAT * ROWS * K * 2.0 / (t1 - t0) / 1e9);
     }
+    double med = median(gops);
+    double mn = *std::min_element(gops.begin(), gops.end());
+    double mx = *std::max_element(gops.begin(), gops.end());
+    printf("  INT8 compute (in-cache, original):          %7.2f GOP/s  (min: %5.2f, max: %5.2f)\n", med, mn, mx);
+    return med;
+}
 
-    double med = median(gops_list);
-    printf("  INT8 MAC:    %7.2f GOP/s\n", med);
+static double int8_compute_variant_g(int reps) {
+    const int K = 896, ROWS = 16;
+    const long REPEAT = 200000;
+    const int nthreads = omp_get_max_threads();
+    volatile int32_t sink = 0;
+    std::vector<double> gops;
+    for (int r = 0; r < reps; r++) {
+        double t0 = now_sec();
+        #pragma omp parallel
+        {
+            std::vector<int8_t> w(ROWS * K), a(K);
+            for (int i = 0; i < ROWS * K; i++) w[i] = (int8_t)((i * 7 + 3) % 251 - 125);
+            for (int i = 0; i < K; i++)        a[i] = (int8_t)((i * 11 + 5) % 251 - 125);
+            int32_t total = 0;
+            for (long rep = 0; rep < REPEAT; rep++) {
+                int32_t round_sum = 0;
+                for (int row = 0; row < ROWS; row++) {
+                    float acc = 0.0f;
+                    for (int g = 0; g < K / 64; g++) {
+                        int32_t s = 0;
+                        const int8_t* pa = a.data() + g * 64;
+                        const int8_t* pw = w.data() + (size_t)row * K + g * 64;
+                        for (int k = 0; k < 64; k++) s += (int32_t)pa[k] * (int32_t)pw[k];
+                        acc += (float)s * 0.01f;
+                    }
+                    round_sum += (int32_t)acc;
+                }
+                a[0] = (int8_t)(round_sum & 0x3f);
+                total += round_sum;
+            }
+            #pragma omp critical
+            sink += total;
+        }
+        double t1 = now_sec();
+        gops.push_back((double)nthreads * REPEAT * ROWS * K * 2.0 / (t1 - t0) / 1e9);
+    }
+    double med = median(gops);
+    double mn = *std::min_element(gops.begin(), gops.end());
+    double mx = *std::max_element(gops.begin(), gops.end());
+    printf("  INT8 compute Variant G (grouped horizontal): %7.2f GOP/s  (min: %5.2f, max: %5.2f)\n", med, mn, mx);
+    return med;
+}
 
-    // Prevent optimizing away
-    volatile int32_t v = 0;
-    for (int i = 0; i < num_dots; i++) v += results[i];
-
-    printf("\n");
+static double int8_compute_variant_l(int reps) {
+    const int K = 896, ROWS = 16;
+    const long REPEAT = 200000;
+    const int nthreads = omp_get_max_threads();
+    volatile int32_t sink = 0;
+    std::vector<double> gops;
+    for (int r = 0; r < reps; r++) {
+        double t0 = now_sec();
+        #pragma omp parallel
+        {
+            std::vector<int8_t> w(ROWS * K), a(K);
+            for (int i = 0; i < ROWS * K; i++) w[i] = (int8_t)((i * 7 + 3) % 251 - 125);
+            for (int i = 0; i < K; i++)        a[i] = (int8_t)((i * 11 + 5) % 251 - 125);
+            int32_t total = 0;
+            for (long rep = 0; rep < REPEAT; rep++) {
+                int32_t round_sum = 0;
+                for (int row = 0; row < ROWS; row++) {
+                    float lane[16] = {0};
+                    for (int g = 0; g < K / 64; g++) {
+                        int32_t part[16] = {0};
+                        const int8_t* pa = a.data() + g * 64;
+                        const int8_t* pw = w.data() + (size_t)row * K + g * 64;
+                        for (int k = 0; k < 64; k += 16)
+                            for (int l = 0; l < 16; l++) part[l] += (int32_t)pa[k + l] * (int32_t)pw[k + l];
+                        for (int l = 0; l < 16; l++) lane[l] += (float)part[l] * 0.01f;
+                    }
+                    float acc = 0.0f;
+                    for (int l = 0; l < 16; l++) acc += lane[l];
+                    round_sum += (int32_t)acc;
+                }
+                a[0] = (int8_t)(round_sum & 0x3f);
+                total += round_sum;
+            }
+            #pragma omp critical
+            sink += total;
+        }
+        double t1 = now_sec();
+        gops.push_back((double)nthreads * REPEAT * ROWS * K * 2.0 / (t1 - t0) / 1e9);
+    }
+    double med = median(gops);
+    double mn = *std::min_element(gops.begin(), gops.end());
+    double mx = *std::max_element(gops.begin(), gops.end());
+    printf("  INT8 compute Variant L (lane-wise accum):   %7.2f GOP/s  (min: %5.2f, max: %5.2f)\n", med, mn, mx);
+    return med;
 }
 
 // ---------------------------------------------------------------------------
@@ -259,40 +348,29 @@ static void lm_head_bandwidth_benchmark(int reps) {
 // 5. Roofline summary
 // ---------------------------------------------------------------------------
 
-static void print_roofline_summary(double peak_bw_gbs, double peak_gflops) {
+static void print_roofline_summary(double peak_bw_gbs, double peak_int8_gops, double peak_fp32_gflops) {
     printf("=== Roofline Summary ===\n");
     printf("  Peak bandwidth:  %.2f GB/s\n", peak_bw_gbs);
-    printf("  Peak compute:    %.2f GFLOP/s (scalar FMA)\n", peak_gflops);
-    printf("  Ridge point:     %.2f FLOP/byte\n", peak_gflops / peak_bw_gbs);
+    printf("  Peak INT8:       %.2f GOP/s\n", peak_int8_gops);
+    printf("  Peak FP32:       %.2f GFLOP/s\n", peak_fp32_gflops);
+    printf("  INT8 ridge:      %.2f OP/byte\n", peak_int8_gops / peak_bw_gbs);
+    printf("  FP32 ridge:      %.2f FLOP/byte\n", peak_fp32_gflops / peak_bw_gbs);
     printf("\n");
 
-    // Compute operational intensity for decode matmuls
-    // For M=1 (decode), a matmul [1,K] × [N,K]^T reads N*sizeof_w bytes
-    // and does 2*N*K FLOPs, so OI = 2*K / sizeof_w
+    printf("  --- Operational Intensity for decode ---\n");
 
-    printf("  --- Operational Intensity for decode (M=1) ---\n");
-    printf("  %-28s  OI (FLOP/B)  Bound\n", "Kernel");
-    printf("  %-28s  ----------  -----\n", "------");
-
-    auto classify = [&](const char* name, int K, int elem_bytes) {
-        double oi = 2.0 * K / elem_bytes;
-        double ridge = peak_gflops / peak_bw_gbs;
-        const char* bound = (oi < ridge) ? "MEM" : "COMPUTE";
-        printf("  %-28s  %10.1f  %s\n", name, oi, bound);
+    auto classify = [&](const char* name, int M, int elem_bytes, double peak_ops) {
+        double oi = 2.0 * M / elem_bytes;                  // ops per weight byte
+        double ridge = peak_ops / peak_bw_gbs;
+        double attainable = std::min(peak_ops, peak_bw_gbs * oi);
+        printf("  %-26s OI %5.1f  ridge %6.1f  attainable %7.1f GOP/s  %s\n",
+               name, oi, ridge, attainable, oi < ridge ? "MEMORY-bound" : "COMPUTE-bound");
     };
+    classify("INT8 weights, batch 1", 1, 1, peak_int8_gops);
+    classify("INT8 weights, batch 8", 8, 1, peak_int8_gops);
+    classify("FP32 weights, batch 1", 1, 4, peak_fp32_gflops);
+    classify("FP32 weights, batch 8", 8, 4, peak_fp32_gflops);
 
-    // Qwen2.5-0.5B dimensions
-    classify("W8A8 layer (K=896)",        896, 1);  // INT8 weights
-    classify("FP32 layer (K=896)",        896, 4);  // FP32 weights
-    classify("W8A8 LM head (K=896)",      896, 1);  // INT8 LM head
-    classify("FP32 LM head (K=896)",      896, 4);  // FP32 LM head
-    classify("W8A8 MLP gate (K=896)",     896, 1);  // gate_proj
-    classify("W8A8 MLP down (K=2432)",   2432, 1);  // down_proj (intermediate)
-
-    printf("\n");
-    printf("  Note: OI for W8A8 counts only weight bytes (dominant at M=1).\n");
-    printf("  At M=1, every kernel is deep in the memory-bound regime\n");
-    printf("  unless OI > %.1f FLOP/byte (the ridge point).\n", peak_gflops / peak_bw_gbs);
     printf("\n");
 }
 
@@ -307,22 +385,34 @@ int main() {
 
     // 1. STREAM — use 64 MiB per array to exceed L3
     size_t stream_n = 8 * 1024 * 1024;  // 8M doubles = 64 MiB
-    stream_benchmark(stream_n, 20);
+    double bw_triad = stream_benchmark(stream_n, 20);
 
-    // 2. FP32 peak
-    fp32_throughput_benchmark(10);
+    // Read-only bandwidth benchmark
+    printf("=== Read-Only Bandwidth ===\n");
+    double bw_read = read_bandwidth_benchmark(64 * 1024 * 1024, 20);
+    printf("\n");
 
-    // 3. INT8 dot product
-    int8_throughput_benchmark(10);
+    double peak_bw = std::max(bw_read, bw_triad);
+
+    // 2. FP32 peak (vector FMA)
+    printf("=== Peak FP32 Throughput ===\n");
+    double fp32 = fp32_vector_benchmark(10);
+    printf("\n");
+
+    // 3. INT8 compute (in-cache)
+    printf("=== Peak INT8 Throughput ===\n");
+    double int8 = int8_compute_benchmark(5);
+    int8_compute_variant_g(5);
+    int8_compute_variant_l(5);
+    printf("\n");
 
     // 4. LM head effective bandwidth
     lm_head_bandwidth_benchmark(20);
 
-    // 5. Summary — use Triad BW and scalar FMA peak
-    // (We'll read the numbers from the output and plug them in;
-    //  for now, re-run the key benchmarks to get the values)
-    printf("(Run complete. Use the Triad BW and scalar FMA GFLOP/s above\n");
-    printf(" to compute your roofline ridge point.)\n\n");
+    // 5. Summary
+    print_roofline_summary(peak_bw, int8, fp32);
+
+    printf("CSV,mem_best_gbs,%.2f\nCSV,peak_int8_gops,%.2f\nCSV,peak_fp32_gflops,%.2f\n", peak_bw, int8, fp32);
 
     return 0;
 }
