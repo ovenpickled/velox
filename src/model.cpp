@@ -13,7 +13,9 @@
 #include <string>
 #include <sstream>
 #include <set>
+#ifdef __GLIBC__
 #include <malloc.h>
+#endif
 
 using json = nlohmann::json;
 

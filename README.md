@@ -2,10 +2,12 @@
 
 A C++ inference engine for running Qwen2.5-style transformer models on CPU. It loads models directly from [safetensors](https://github.com/huggingface/safetensors) files, quantizes weights to INT8, and runs batched autoregressive generation with a growable KV cache - no PyTorch or Python runtime required at inference time.
 
+See ['RESULTS.md'](RESULTS.md) for the optimization write-up.
+
 ## Techniques
 
 - **Memory-mapped model loading** - [`safetensors.cpp`](src/safetensors.cpp) maps the model file directly into memory with [`mmap`](https://man7.org/linux/man-pages/man2/mmap.2.html) instead of reading it into a buffer. Tensors are read from the mapped region. F32 tensors are read in place; BF16 and F16 tensors are converted to FP32 once during loading (a temporary copy), quantized, and then the FP32 copies are freed and the file is unmapped.
-- **Row-wise INT8 quantization (W8A8)** - Weights are quantized once at load time in [`ops::quantize_rowwise`](src/ops.cpp), with one scale factor per output row. Activations are quantized dynamically on every forward pass in [`ops::matmul_w8a8`](src/ops.cpp) with one scale per group of 64 channels (`ACT_GROUP`), so a single outlier channel cannot wipe out the precision of the whole row. The integer dot product is rescaled per group. The LM head is quantized too, which cuts the bytes streamed per decoded token roughly 4x compared to FP32 weights.
+- **Row-wise INT8 quantization (W8A8)** - Weights are quantized once at load time in [`ops::quantize_rowwise`](src/ops.cpp), with one scale factor per output row. Activations are quantized dynamically on every forward pass in [`ops::matmul_w8a8`](src/ops.cpp) with one scale per group of 128 channels (`ACT_GROUP`), so a single outlier channel cannot wipe out the precision of the whole row. The integer dot product is rescaled per group. The LM head is quantized too, which cuts the bytes streamed per decoded token roughly 4x compared to FP32 weights.
 - **Grouped-query attention** - [`model.hpp`](include/model.hpp) configures fewer key/value heads (`num_key_value_heads`) than query heads (`num_attention_heads`), so multiple query heads share the same K/V projections. This shrinks the KV cache without changing attention quality much. See the [original GQA paper](https://arxiv.org/abs/2305.13245) for background.
 - **Rotary position embeddings (RoPE)** - [`ops::rope`](src/ops.cpp) rotates query/key vectors by an angle derived from token position instead of adding a position vector. It encodes relative position directly into the attention dot product.
 - **Amortized KV cache growth** - [`KVCache::ensure_capacity`](include/model.hpp) doubles the cache buffer whenever it runs out of room, the same growth strategy used internally by [`std::vector`](https://en.cppreference.com/w/cpp/container/vector). This keeps reallocation cost to `O(1)` amortized per token instead of resizing on every step.
@@ -14,6 +16,7 @@ A C++ inference engine for running Qwen2.5-style transformer models on CPU. It l
 - **BF16 to FP32 conversion via bit manipulation** - [`SafetensorsFile::bf16_to_float`](src/safetensors.cpp) reconstructs a float from a bfloat16 value by shifting its bits into the upper 16 bits of a 32-bit float, since BF16 is just a truncated FP32.
 - **Byte-level BPE tokenizer without regex** - [`tokenizer.cpp`](src/tokenizer.cpp) implements Qwen2's pre-tokenizer split rules by hand (single digits, optional leading punctuation, Unicode letters and numbers via the generated tables in [`unicode_tables.hpp`](include/unicode_tables.hpp)) instead of using a regex engine, and maps special tokens such as `<|im_start|>` to their ids. It was fuzz-tested against the reference regex; check it against your own `tokenizer.json` with [`scripts/check_tokenizer.py`](scripts/check_tokenizer.py).
 - **Non-owning tensor views** - [`Tensor::view`](include/tensor.hpp) and [`Tensor::row`](include/tensor.hpp) reinterpret existing memory with a new shape instead of copying data, similar to how NumPy views work.
+- **Load-time protection of outlier-sensitive matrices** - the first token of every sequence carries "massive activations" (|x| ~ 1000 on a few channels). INT8 weights cannot represent products with such values, which broke single-token prompts. At load time the engine runs one calibration token, finds the MLP matrices whose input exceeds 100 at that position, and keeps just those in FP32 (on Qwen2.5-0.5B: layer 2's down projection and layers 3 and 21's gate/up/down, about 122 MB in FP32). Disable with `VELOX_NO_AUTO_FP32=1`.
 
 ## Notable Libraries & Technologies
 
@@ -27,25 +30,48 @@ A C++ inference engine for running Qwen2.5-style transformer models on CPU. It l
 ## Project Structure
 
 ```
-.
-├── CMakeLists.txt
-├── README.md
-├── include/
-├── scripts/
-└── src/
+   .
+   ├── CMakeLists.txt
+   ├── README.md
+   ├── RESULTS.md
+   ├── docs/
+   ├── include/
+   ├── scripts/
+   ├── src/
+   └── tools/
 ```
 
+- ['docs/'](docs/) - holds the roofline plot and the raw measurements.
 - [`include/`](include/) - public headers defining the model, tensor, tokenizer, sampler, and safetensors interfaces.
 - [`src/`](src/) - implementation files, including the main inference loop and CLI entry point in [`main.cpp`](src/main.cpp).
-- [`scripts/`](scripts/) - Python tooling for cross-checking output against Hugging Face `transformers`.
+- [`scripts/`](scripts/) - Python tooling for cross-checking the engine against Hugging Face `transformers`:
+  - [`verify.py`](scripts/verify.py) writes reference logits for a prompt.
+  - [`compare.py`](scripts/compare.py) compares engine logits (written with `VELOX_DUMP_LOGITS`) against that reference: mean and max difference, top-1 match and top-10 overlap.
+  - [`check_tokenizer.py`](scripts/check_tokenizer.py) compares the engine's token ids (via `--tokenize-only`) against Hugging Face's on a set of tricky strings.
+- ['tools/'](docs/) - holds ['roofline_bench.cpp'](tools/roofline_bench.cpp) (bandwidth and compute ceilings) and ['roofline_vec_test.cpp'](tools/roofline_vec_test.cpp) (kernel bandwidth check).
+
+## Build and run
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+./build/inference --model <model_dir> --prompt "Hello" --max-tokens 64 [--batch-size N] [--temperature T] [--greedy] [--benchmark]
+```
+
+`<model_dir>` needs `config.json`, `tokenizer.json` and `model.safetensors` (BF16, F16 or F32). `OMP_NUM_THREADS=4` is enough for batch 1; 6 helps at batch 8. The build expects `external/json.hpp` (nlohmann/json).
 
 ## Diagnostics
 
+Command-line options:
 - `--tokenize-only` prints the prompt's token ids as a JSON list and exits without loading the model.
-- `VELOX_PROF=1` prints a running average of forward-pass and LM-head time to stderr.
+- `--benchmark` runs the batch-size sweep used for the table below.
+
+Environment variables (all off by default):
+- `VELOX_PROF=1` prints a running average of forward-pass and LM-head time to stderr, plus resident memory after loading. `VELOX_PROF=2` adds a per-component breakdown (norms, QKV, attention, O projection, FFN projections, activation).
 - `VELOX_DUMP_LOGITS=<file>` writes the first-step logits (single-sequence mode) in the format [`scripts/compare.py`](scripts/compare.py) reads.
-- `VELOX_W8A32=1` runs the projections with FP32 activations (INT8 weights) to separate weight-quantization error from activation-quantization error.
-- `VELOX_DEBUG_ACT=1` prints per-layer activation statistics for the prefill pass.
+- `VELOX_DEBUG_ACT=1` prints per-layer activation statistics for the prefill pass (max, mean, outlier ratio and channel).
+- `VELOX_NO_AUTO_FP32=1` turns off the load-time FP32 protection of outlier-sensitive matrices.
+- `VELOX_FP32_LAYERS=all` or a list like `2,3,21` keeps FP32 copies of those layers' weights and runs them in FP32. `VELOX_FP32_PROJ=q,k,v,o,gate,up,down` restricts that to the listed projections. `VELOX_FP32_LMHEAD=1` runs the LM head in FP32 (tied embeddings only).
+- `VELOX_W8A32=1` runs the INT8-weight projections with FP32 activations, to separate weight-quantization error from activation-quantization error.
 
 ## Benchmarks
 
@@ -71,14 +97,18 @@ Batch-1 decode is memory-bound and gains nothing beyond about 4 threads; batch 8
 
 The last row is slower than the one above it at batch 1 on purpose: the earlier version produced wrong answers for single-token prompts (mean logit error about 1.2 versus about 0.14 now). Earlier rows are single 64-token runs, the last is the benchmark mean, so small differences between rows are within noise.
 
-Resident memory after loading is about 1.3 GB, of which 0.55 GB is the FP32 embedding table.
+Resident memory after loading is about 1.3 GB, 1337 MB measured with `VELOX_PROF=1`, of which 0.55 GB is the FP32 embedding table.
 
 ### Roofline
-![roofline](docs/roofline.png)
-Build:  g++ -O3 -march=native -fopenmp -o roofline_bench tools/roofline_bench.cpp -lm
-Run:    ./roofline_bench
 
-Measured on this machine: 25.8 GB/s read bandwidth (saturated by about 2 threads) and 271 GOP/s (4 threads) / 460 GOP/s (6 threads) for the autovectorised INT8 kernel. Batch-1 decode streams about 22 GB/s of weights, roughly 87% of the memory ceiling, so it is bandwidth-bound. Batch-8 decode reaches about 41% of its roof, so the INT8 kernel, not memory, is the limit there.
+![roofline](docs/roofline.png)
+
+```bash
+g++ -O3 -march=native -fopenmp -o roofline_bench tools/roofline_bench.cpp -lm
+OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores ./roofline_bench
+```
+
+Measured on this machine (raw output in [`docs/roofline.txt`](docs/roofline.txt)): read bandwidth peaks at 25.8 GB/s (median 23.9 GB/s at 4 threads; about 2 threads already saturate it), and the autovectorised INT8 kernel reaches 271 GOP/s at 4 threads and 460 GOP/s at 6 threads. Percentages below are relative to the peak bandwidth. Batch-1 decode streams about 22 GB/s of weights, roughly 87% of peak (94% of the median), so it is bandwidth-bound. Batch-8 decode reaches about 41% of its roof, so the INT8 kernel, not memory, is the limit there.
 
 ## Known limitations
 

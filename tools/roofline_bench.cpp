@@ -74,20 +74,20 @@ static double stream_benchmark(size_t n_elements, int reps) {
     printf("=== STREAM Bandwidth (N = %zu doubles, %.1f MiB per array) ===\n",
            n_elements, n_elements * 8.0 / (1024*1024));
 
-    double bw_copy = bench("Copy", 2*8, [&]{
-        #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < n_elements; i++) c[i] = a[i];
-    });
+    // double bw_copy = bench("Copy", 2*8, [&]{
+    //     #pragma omp parallel for schedule(static)
+    //     for (size_t i = 0; i < n_elements; i++) c[i] = a[i];
+    // });
 
-    double bw_scale = bench("Scale", 2*8, [&]{
-        #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < n_elements; i++) b[i] = scalar * c[i];
-    });
+    // double bw_scale = bench("Scale", 2*8, [&]{
+    //     #pragma omp parallel for schedule(static)
+    //     for (size_t i = 0; i < n_elements; i++) b[i] = scalar * c[i];
+    // });
 
-    double bw_add = bench("Add", 3*8, [&]{
-        #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < n_elements; i++) c[i] = a[i] + b[i];
-    });
+    // double bw_add = bench("Add", 3*8, [&]{
+    //     #pragma omp parallel for schedule(static)
+    //     for (size_t i = 0; i < n_elements; i++) c[i] = a[i] + b[i];
+    // });
 
     double bw_triad = bench("Triad", 3*8, [&]{
         #pragma omp parallel for schedule(static)
