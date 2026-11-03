@@ -10,11 +10,13 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include "json.hpp"
 #include "model.hpp"
 #include "tokenizer.hpp"
 #include "sampler.hpp"
 
 using namespace std::chrono;
+using json = nlohmann::json;
 
 static int parse_int(const std::string& flag, const char* text) {
     try {
@@ -65,6 +67,9 @@ static int run(int argc, char* argv[]) {
     bool greedy = true;
     bool benchmark = false;
     bool tokenize_only = false;
+    bool tokenize_json = false;
+    bool decode_json = false;
+    KVType kv_type = KVType::FP32;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -80,12 +85,21 @@ static int run(int argc, char* argv[]) {
         else if (arg == "--greedy") greedy = true;
         else if (arg == "--benchmark") benchmark = true;
         else if (arg == "--tokenize-only") tokenize_only = true;
+        else if (arg == "--tokenize-json") tokenize_json = true;
+        else if (arg == "--decode-json") decode_json = true;
+        else if (arg == "--kv-cache-type") {
+            std::string t = value();
+            if (t == "int8" || t == "INT8" || t == "q8_0") kv_type = KVType::INT8;
+            else if (t == "fp32" || t == "FP32" || t == "f32") kv_type = KVType::FP32;
+            else throw std::invalid_argument("unknown --kv-cache-type: " + t + " (expected fp32 or int8)");
+        }
         else throw std::invalid_argument("unknown argument: " + arg);
     }
 
     if (model_dir.empty()) {
         std::cerr << "Usage: inference --model <path> [--prompt <text>] [--max-tokens N] "
-                  << "[--batch-size N] [--temperature T] [--greedy] [--benchmark] [--tokenize-only]" << std::endl;
+                  << "[--batch-size N] [--temperature T] [--greedy] [--benchmark] [--tokenize-only] "
+                  << "[--tokenize-json] [--decode-json] [--kv-cache-type fp32|int8]" << std::endl;
         return 1;
     }
     if (max_tokens < 1) throw std::invalid_argument("--max-tokens must be at least 1");
@@ -101,6 +115,31 @@ static int run(int argc, char* argv[]) {
         std::cerr << "Failed to load tokenizer from " << model_dir << "/tokenizer.json" << std::endl;
         return 1;
     }
+
+    if (tokenize_json) {
+        json input_array;
+        std::cin >> input_array;
+        json output_array = json::array();
+        for (const auto& item : input_array) {
+            std::string text = item.get<std::string>();
+            output_array.push_back(tokenizer.encode(text));
+        }
+        std::cout << output_array.dump() << std::endl;
+        return 0;
+    }
+
+    if (decode_json) {
+        json input_array;
+        std::cin >> input_array;
+        json output_array = json::array();
+        for (const auto& item : input_array) {
+            std::vector<int> ids = item.get<std::vector<int>>();
+            output_array.push_back(tokenizer.decode(ids));
+        }
+        std::cout << output_array.dump() << std::endl;
+        return 0;
+    }
+
     auto input_tokens = tokenizer.encode(prompt);
 
     if (tokenize_only) {  // prints the ids as a JSON list, e.g. [9707,11]; used to compare against Hugging Face
@@ -113,10 +152,11 @@ static int run(int argc, char* argv[]) {
         throw std::invalid_argument("the prompt encodes to zero tokens; please give a non-empty --prompt");
     }
 
-    std::cout << "Loading model from " << model_dir << "..." << std::endl;
+    std::cout << "Loading model from " << model_dir << "... (KV Cache: "
+              << (kv_type == KVType::INT8 ? "INT8" : "FP32") << ")" << std::endl;
     Qwen2Model model;
     int max_bs = benchmark ? std::max(batch_size, 8) : batch_size;
-    if (!model.load(model_dir, max_bs)) {
+    if (!model.load(model_dir, max_bs, kv_type)) {
         std::cerr << "Failed to load model" << std::endl;
         return 1;
     }

@@ -52,9 +52,27 @@ ModelConfig ModelConfig::from_json(const std::string& config_json_path) {
 
 const ModelConfig& Qwen2Model::config() const { return config_; }
 int Qwen2Model::max_batch_size() const { return max_batch_size_; }
-int Qwen2Model::max_context() const { return std::min(config_.max_position_embeddings, 4096); }
+int Qwen2Model::max_context() const { return std::min(config_.max_position_embeddings, 8192); }
 
-bool Qwen2Model::load(const std::string& model_dir, int max_batch_size) {
+size_t Qwen2Model::kv_cache_memory_bytes() const {
+    size_t total = 0;
+    for (const auto& cache : kv_caches_) total += cache.memory_bytes();
+    return total;
+}
+
+size_t Qwen2Model::kv_cache_active_bytes() const {
+    size_t total = 0;
+    for (const auto& cache : kv_caches_) total += cache.active_bytes();
+    return total;
+}
+
+bool Qwen2Model::load(const std::string& model_dir, int max_batch_size, KVType kv_type) {
+    if (const char* env_kv = std::getenv("VELOX_KV_INT8")) {
+        if (std::string(env_kv) == "1" || std::string(env_kv) == "true") {
+            kv_type = KVType::INT8;
+        }
+    }
+    kv_type_ = kv_type;
     config_ = ModelConfig::from_json(model_dir + "/config.json");
 
     if (config_.num_attention_heads <= 0 || config_.num_key_value_heads <= 0 ||
@@ -78,7 +96,7 @@ bool Qwen2Model::load(const std::string& model_dir, int max_batch_size) {
     max_batch_size_ = max_batch_size;
     kv_caches_.resize(max_batch_size);
     for (int b = 0; b < max_batch_size; b++) {
-        kv_caches_[b].init(config_.num_hidden_layers, config_.num_key_value_heads, config_.head_dim, 128);
+        kv_caches_[b].init(config_.num_hidden_layers, config_.num_key_value_heads, config_.head_dim, 128, kv_type_);
     }
     allocate_buffers(1, 1, 1);
 
@@ -473,56 +491,156 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         }
 
         // Append K/V to per-sequence caches (valid positions only)
-        for (int b = 0; b < batch_size; b++) {
-            float* k_cache = kv_caches_[b].k_cache[layer].data();
-            float* v_cache = kv_caches_[b].v_cache[layer].data();
-            std::memcpy(k_cache + past_lens[b] * kv_dim,
-                       k_buf_.data() + b * max_len * kv_dim,
-                       actual_lens[b] * kv_dim * sizeof(float));
-            std::memcpy(v_cache + past_lens[b] * kv_dim,
-                       v_buf_.data() + b * max_len * kv_dim,
-                       actual_lens[b] * kv_dim * sizeof(float));
+        if (kv_type_ == KVType::FP32) {
+            for (int b = 0; b < batch_size; b++) {
+                float* k_cache = kv_caches_[b].k_cache[layer].data();
+                float* v_cache = kv_caches_[b].v_cache[layer].data();
+                std::memcpy(k_cache + past_lens[b] * kv_dim,
+                           k_buf_.data() + b * max_len * kv_dim,
+                           actual_lens[b] * kv_dim * sizeof(float));
+                std::memcpy(v_cache + past_lens[b] * kv_dim,
+                           v_buf_.data() + b * max_len * kv_dim,
+                           actual_lens[b] * kv_dim * sizeof(float));
+            }
+        } else {
+            for (int b = 0; b < batch_size; b++) {
+                int8_t* k_cache_i8 = kv_caches_[b].k_cache_i8[layer].data();
+                float* k_scales = kv_caches_[b].k_scales[layer].data();
+                int8_t* v_cache_i8 = kv_caches_[b].v_cache_i8[layer].data();
+                float* v_scales = kv_caches_[b].v_scales[layer].data();
+
+                for (int p = 0; p < actual_lens[b]; p++) {
+                    int slot = past_lens[b] + p;
+                    const float* k_src = k_buf_.data() + (b * max_len + p) * kv_dim;
+                    const float* v_src = v_buf_.data() + (b * max_len + p) * kv_dim;
+
+                    for (int kv_h = 0; kv_h < num_kv_heads; kv_h++) {
+                        const float* kh_src = k_src + kv_h * head_dim;
+                        const float* vh_src = v_src + kv_h * head_dim;
+
+                        // Quantize Key head
+                        float max_k = 0.0f;
+                        for (int d = 0; d < head_dim; d++) max_k = std::max(max_k, std::abs(kh_src[d]));
+                        float scale_k = max_k / 127.0f;
+                        k_scales[slot * num_kv_heads + kv_h] = scale_k;
+                        float inv_k = (scale_k > 0.0f) ? (1.0f / scale_k) : 0.0f;
+                        int8_t* kh_dst = k_cache_i8 + slot * kv_dim + kv_h * head_dim;
+                        for (int d = 0; d < head_dim; d++) {
+                            float s = kh_src[d] * inv_k;
+                            kh_dst[d] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, s))));
+                        }
+
+                        // Quantize Value head
+                        float max_v = 0.0f;
+                        for (int d = 0; d < head_dim; d++) max_v = std::max(max_v, std::abs(vh_src[d]));
+                        float scale_v = max_v / 127.0f;
+                        v_scales[slot * num_kv_heads + kv_h] = scale_v;
+                        float inv_v = (scale_v > 0.0f) ? (1.0f / scale_v) : 0.0f;
+                        int8_t* vh_dst = v_cache_i8 + slot * kv_dim + kv_h * head_dim;
+                        for (int d = 0; d < head_dim; d++) {
+                            float s = vh_src[d] * inv_v;
+                            vh_dst[d] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, s))));
+                        }
+                    }
+                }
+            }
         }
         if (prof_detail_on) prof_rope_bias_ms += DurMS(tick() - t_rope_bias).count();
 
         // Attention (per-sequence — different cache lengths)
         auto t_attn = tick();
-        #pragma omp parallel for collapse(2) if(static_cast<size_t>(batch_size) * num_heads >= 16)
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int b = 0; b < batch_size; b++) {
             for (int h = 0; h < num_heads; h++) {
                 int al = actual_lens[b];
                 int pl = past_lens[b];
                 int tl = pl + al;
-                float* k_cache = kv_caches_[b].k_cache[layer].data();
-                float* v_cache = kv_caches_[b].v_cache[layer].data();
                 int kv_h = h / heads_per_group;
 
-                for (int qp = 0; qp < al; qp++) {
-                    int gp = b * max_len + qp;
-                    int actual_qpos = pl + qp;
-                    float* scores = attn_scores_.data() 
-                        + ((static_cast<size_t>(b) * num_heads + h) * max_len + qp) * max_total_len;
+                if (kv_type_ == KVType::FP32) {
+                    float* k_cache = kv_caches_[b].k_cache[layer].data();
+                    float* v_cache = kv_caches_[b].v_cache[layer].data();
 
-                    for (int kp = 0; kp < tl; kp++) {
-                        if (kp > actual_qpos) {
-                            scores[kp] = -INFINITY;
-                        } else {
-                            float dot = 0;
-                            for (int d = 0; d < head_dim; d++) {
-                                dot += q_buf_[gp * q_dim + h * head_dim + d]
-                                     * k_cache[kp * kv_dim + kv_h * head_dim + d];
+                    for (int qp = 0; qp < al; qp++) {
+                        int gp = b * max_len + qp;
+                        int actual_qpos = pl + qp;
+                        float* scores = attn_scores_.data() 
+                            + ((static_cast<size_t>(b) * num_heads + h) * max_len + qp) * max_total_len;
+                        const float* q_ptr = q_buf_.data() + gp * q_dim + h * head_dim;
+
+                        for (int kp = 0; kp < tl; kp++) {
+                            if (kp > actual_qpos) {
+                                scores[kp] = -INFINITY;
+                            } else {
+                                const float* k_ptr = k_cache + kp * kv_dim + kv_h * head_dim;
+                                float dot = 0.0f;
+                                #pragma omp simd reduction(+:dot)
+                                for (int d = 0; d < head_dim; d++) {
+                                    dot += q_ptr[d] * k_ptr[d];
+                                }
+                                scores[kp] = dot * scale;
                             }
-                            scores[kp] = dot * scale;
+                        }
+                        ops::softmax(scores, tl);
+
+                        float acc[128] = {0.0f};
+                        for (int kp = 0; kp < tl; kp++) {
+                            float s = scores[kp];
+                            if (s == 0.0f) continue;
+                            const float* v_ptr = v_cache + kp * kv_dim + kv_h * head_dim;
+                            #pragma omp simd
+                            for (int d = 0; d < head_dim; d++) {
+                                acc[d] += s * v_ptr[d];
+                            }
+                        }
+                        for (int d = 0; d < head_dim; d++) {
+                            attn_out_[gp * q_dim + h * head_dim + d] = acc[d];
                         }
                     }
-                    ops::softmax(scores, tl);
+                } else {
+                    const int8_t* k_cache_i8 = kv_caches_[b].k_cache_i8[layer].data();
+                    const float* k_scales = kv_caches_[b].k_scales[layer].data();
+                    const int8_t* v_cache_i8 = kv_caches_[b].v_cache_i8[layer].data();
+                    const float* v_scales = kv_caches_[b].v_scales[layer].data();
 
-                    for (int d = 0; d < head_dim; d++) {
-                        float val = 0;
+                    for (int qp = 0; qp < al; qp++) {
+                        int gp = b * max_len + qp;
+                        int actual_qpos = pl + qp;
+                        float* scores = attn_scores_.data() 
+                            + ((static_cast<size_t>(b) * num_heads + h) * max_len + qp) * max_total_len;
+                        const float* q_ptr = q_buf_.data() + gp * q_dim + h * head_dim;
+
                         for (int kp = 0; kp < tl; kp++) {
-                            val += scores[kp] * v_cache[kp * kv_dim + kv_h * head_dim + d];
+                            if (kp > actual_qpos) {
+                                scores[kp] = -INFINITY;
+                            } else {
+                                const int8_t* k_ptr = k_cache_i8 + kp * kv_dim + kv_h * head_dim;
+                                float k_s = k_scales[kp * num_kv_heads + kv_h];
+                                float dot = 0.0f;
+                                #pragma omp simd reduction(+:dot)
+                                for (int d = 0; d < head_dim; d++) {
+                                    dot += q_ptr[d] * static_cast<float>(k_ptr[d]);
+                                }
+                                scores[kp] = (dot * k_s) * scale;
+                            }
                         }
-                        attn_out_[gp * q_dim + h * head_dim + d] = val;
+                        ops::softmax(scores, tl);
+
+                        float acc[128] = {0.0f};
+                        for (int kp = 0; kp < tl; kp++) {
+                            float s = scores[kp];
+                            if (s == 0.0f) continue;
+                            float v_s = v_scales[kp * num_kv_heads + kv_h];
+                            float s_scaled = s * v_s;
+                            const int8_t* v_ptr = v_cache_i8 + kp * kv_dim + kv_h * head_dim;
+                            #pragma omp simd
+                            for (int d = 0; d < head_dim; d++) {
+                                acc[d] += s_scaled * static_cast<float>(v_ptr[d]);
+                            }
+                        }
+                        for (int d = 0; d < head_dim; d++) {
+                            attn_out_[gp * q_dim + h * head_dim + d] = acc[d];
+                        }
                     }
                 }
             }
