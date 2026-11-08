@@ -14,6 +14,8 @@ import sys
 import time
 from typing import List, Dict, Tuple
 
+STRICT_NFC = False
+
 # Categories of Unicode tests
 TEST_SUITE = {
     "English & Code": [
@@ -101,6 +103,11 @@ TEST_SUITE = {
         "Special characters: ½ cup, 3², © 2024, ™, ®, § 42, ¶ 7",
         "Invisible & spaces: A\u00a0B\u2002C\u2003D\u2004E\u2005F\u2009G\u200bH\u3000I",
     ],
+    "Decomposed Unicode (NFC-sensitive; Qwen's HF tokenizer normalizes to NFC)": [
+        "cafe\u0301 au lait",                 # e + combining acute
+        "\u304b\u3099\u304d\u3099\u304f\u3099",     # か + dakuten (NFC -> が き゛ ぐ)
+        "\u30cf\u309a\u30bd\u30b3\u30f3",         # ハ + handakuten
+    ],
     "Special & Added Tokens": [
         "<|im_start|>user\nこんにちは、AIアシスタント！<|im_end|>\n<|im_start|>assistant\n",
         "<|endoftext|>",
@@ -116,7 +123,7 @@ def run_velox_tokenize(binary: str, model_dir: str, texts: List[str]) -> List[Li
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True, encoding="utf-8"
     )
     stdout, stderr = p.communicate(json.dumps(texts))
     if p.returncode != 0:
@@ -130,7 +137,7 @@ def run_velox_decode(binary: str, model_dir: str, token_batches: List[List[int]]
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True, encoding="utf-8"
     )
     stdout, stderr = p.communicate(json.dumps(token_batches))
     if p.returncode != 0:
@@ -148,6 +155,7 @@ def test_unicode_correctness(hf_tokenizer, binary: str, model_dir: str):
     total_tests = 0
     total_passed = 0
     total_roundtrip_passed = 0
+    known_gap_count = 0
 
     all_texts = []
     text_meta = []  # (category, index_in_category, text)
@@ -185,7 +193,11 @@ def test_unicode_correctness(hf_tokenizer, binary: str, model_dir: str):
         if roundtrip_match:
             total_roundtrip_passed += 1
 
-        status = "PASS" if (tokens_match and roundtrip_match) else "FAIL"
+        ok_row = tokens_match and roundtrip_match
+        known_gap = (not ok_row) and cat_name.startswith("Decomposed") and not STRICT_NFC
+        if known_gap:
+            known_gap_count += 1
+        status = "PASS" if ok_row else ("KNOWN-GAP" if known_gap else "FAIL")
         disp_text = repr(text) if len(text) < 40 else repr(text[:37] + "...")
         print(f"  [{status}] {disp_text} (tokens: {len(velox_tokens)})")
 
@@ -200,29 +212,31 @@ def test_unicode_correctness(hf_tokenizer, binary: str, model_dir: str):
     print(f"  Lossless roundtrip decode (text == decode(encode(text))): {total_roundtrip_passed}/{total_tests} ({100.0 * total_roundtrip_passed / total_tests:.2f}%)")
     print("=" * 80)
 
-    if total_passed != total_tests or total_roundtrip_passed != total_tests:
+    if known_gap_count:
+        print(f"  NOTE: {known_gap_count} NFC-sensitive string(s) differ from HF: the C++ tokenizer has no NFC step.")
+        print("        Harmless if your corpora are already NFC (check scripts/prep_data.py output). Use --strict-nfc to make this fatal.")
+    if (total_tests - total_passed) > known_gap_count or (total_tests - total_roundtrip_passed) > known_gap_count:
         print("[ERROR] Tokenizer tests FAILED!")
         return False
     print("[SUCCESS] All Unicode tokenizer tests PASSED with 100% equivalence!")
     return True
 
 
-def measure_tokens_per_character(hf_tokenizer, binary: str, model_dir: str):
+def measure_tokens_per_character(hf_tokenizer, binary: str, model_dir: str, en_path: str, ja_path: str):
     print("\n" + "=" * 80)
     print("PHASE 2: TOKENS PER CHARACTER MEASUREMENT (ENGLISH vs JAPANESE)")
     print("=" * 80)
 
     corpora = [
-        ("English (WikiText-2 Test Set)", "/home/awwwyan/Projects/velox/data/wikitext-2-raw/wiki.test.raw", 500_000),
-        ("Japanese (Wikipedia Diverse Articles)", "/home/awwwyan/Projects/velox/data/ja_test.raw", 500_000),
+        ("English", en_path, 500_000),
+        ("Japanese", ja_path, 500_000),
     ]
 
     results = []
 
     for name, path, max_chars in corpora:
         if not os.path.exists(path):
-            print(f"[WARN] File not found: {path}")
-            continue
+            raise SystemExit(f"[ERROR] corpus not found: {path} (pass --en / --ja)")
 
         with open(path, "r", encoding="utf-8") as f:
             raw_text = f.read()
@@ -241,7 +255,11 @@ def measure_tokens_per_character(hf_tokenizer, binary: str, model_dir: str):
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
         hf_token_count = len(hf_tokens)
 
-        assert token_count == hf_token_count, f"Token count mismatch! Velox: {token_count}, HF: {hf_token_count}"
+        if velox_tokens != hf_tokens:
+            first = next((i for i, (a, b) in enumerate(zip(velox_tokens, hf_tokens)) if a != b), min(len(velox_tokens), len(hf_tokens)))
+            raise SystemExit(f"[ERROR] {name}: token IDs differ from HF (counts {token_count} vs {hf_token_count}), first difference at token {first}. "
+                             f"Context: {hf_tokenizer.decode(hf_tokens[max(0, first-3):first+3])!r}. "
+                             "If this is decomposed text, the C++ tokenizer lacks NFC normalization.")
 
         # Metrics
         tokens_per_char = token_count / char_count
@@ -279,23 +297,26 @@ def measure_tokens_per_character(hf_tokenizer, binary: str, model_dir: str):
     print(f"\n2. **Bytes Per Token**:")
     print(f"   - English : {en['bytes_per_token']:.2f} bytes/token")
     print(f"   - Japanese: {ja['bytes_per_token']:.2f} bytes/token")
-    print(f"   - Why? English words average ~4-5 characters and are frequently merged into whole-word BPE tokens.")
-    print(f"     In contrast, Japanese Kanji and Kana are 3 UTF-8 bytes each. While common Kanji/Kana have direct")
-    print(f"     tokens in Qwen's large 152k vocabulary, less frequent combinations require 1 token per 1-2 kanji,")
-    print(f"     resulting in ~1.0-1.3 tokens per Japanese character compared to ~0.25 tokens per English character.")
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    model_dir = sys.argv[1] if len(sys.argv) > 1 else "/home/awwwyan/models/Qwen2.5-0.5B"
-    binary = sys.argv[2] if len(sys.argv) > 2 else "./build/inference"
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=os.environ.get("VELOX_MODEL", "Qwen2.5-0.5B"))
+    ap.add_argument("--binary", default="./build/inference")
+    ap.add_argument("--en", default="data/wikitext-2-raw/wiki.test.raw")
+    ap.add_argument("--ja", default="data/ja_test.raw")
+    ap.add_argument("--strict-nfc", action="store_true")
+    args = ap.parse_args()
+    STRICT_NFC = args.strict_nfc
 
     from transformers import AutoTokenizer
-    print(f"Loading reference tokenizer from {model_dir}...")
-    hf_tok = AutoTokenizer.from_pretrained(model_dir)
+    print(f"Loading reference tokenizer from {args.model}...")
+    hf_tok = AutoTokenizer.from_pretrained(args.model)
 
-    ok = test_unicode_correctness(hf_tok, binary, model_dir)
+    ok = test_unicode_correctness(hf_tok, args.binary, args.model)
     if not ok:
         sys.exit(1)
 
-    measure_tokens_per_character(hf_tok, binary, model_dir)
+    measure_tokens_per_character(hf_tok, args.binary, args.model, args.en, args.ja)

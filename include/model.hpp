@@ -66,6 +66,11 @@ struct KVCache {
     std::vector<std::vector<int8_t>> v_cache_i8;
     std::vector<std::vector<float>> v_scales;
 
+    // Keys get one scale per KV_K_GROUP values (ablation: per-head scale cost +3.2% PPL, group 32 cost +1.5%).
+    // Values are insensitive to quantization (V-only ablation: no PPL change), so they keep one scale per head.
+    static constexpr int KV_K_GROUP = 32;
+    int k_groups_per_head = 1;
+
     int seq_len = 0;
     int capacity = 0;
     int kv_dim = 0;
@@ -76,11 +81,13 @@ struct KVCache {
         num_kv_heads = n_kv_heads;
         head_dim = h_dim;
         kv_dim = num_kv_heads * head_dim;
+        k_groups_per_head = (head_dim % KV_K_GROUP == 0) ? head_dim / KV_K_GROUP : 1;
         capacity = initial_capacity;
         seq_len = 0;
         type = kv_type;
         size_t layer_size = static_cast<size_t>(capacity) * kv_dim;
         size_t scale_size = static_cast<size_t>(capacity) * num_kv_heads;
+        size_t k_scale_size = scale_size * k_groups_per_head;
 
         if (type == KVType::FP32) {
             k_cache.resize(num_layers);
@@ -96,7 +103,7 @@ struct KVCache {
             v_scales.resize(num_layers);
             for (int i = 0; i < num_layers; i++) {
                 k_cache_i8[i].resize(layer_size, 0);
-                k_scales[i].resize(scale_size, 0.0f);
+                k_scales[i].resize(k_scale_size, 0.0f);
                 v_cache_i8[i].resize(layer_size, 0);
                 v_scales[i].resize(scale_size, 0.0f);
             }
@@ -112,13 +119,14 @@ struct KVCache {
 #endif
         size_t layer_size = static_cast<size_t>(new_capacity) * kv_dim;
         size_t scale_size = static_cast<size_t>(new_capacity) * num_kv_heads;
+        size_t k_scale_size = scale_size * k_groups_per_head;
 
         if (type == KVType::FP32) {
             for (auto& layer : k_cache) layer.resize(layer_size, 0.0f);
             for (auto& layer : v_cache) layer.resize(layer_size, 0.0f);
         } else {
             for (auto& layer : k_cache_i8) layer.resize(layer_size, 0);
-            for (auto& layer : k_scales) layer.resize(scale_size, 0.0f);
+            for (auto& layer : k_scales) layer.resize(k_scale_size, 0.0f);
             for (auto& layer : v_cache_i8) layer.resize(layer_size, 0);
             for (auto& layer : v_scales) layer.resize(scale_size, 0.0f);
         }
@@ -149,8 +157,9 @@ struct KVCache {
         if (type == KVType::FP32) {
             return num_layers * static_cast<size_t>(seq_len) * kv_dim * sizeof(float) * 2;
         } else {
-            size_t bytes_per_pos = kv_dim * sizeof(int8_t) + num_kv_heads * sizeof(float);
-            return num_layers * static_cast<size_t>(seq_len) * bytes_per_pos * 2;
+            size_t k_bytes = kv_dim * sizeof(int8_t) + static_cast<size_t>(num_kv_heads) * k_groups_per_head * sizeof(float);
+            size_t v_bytes = kv_dim * sizeof(int8_t) + static_cast<size_t>(num_kv_heads) * sizeof(float);
+            return num_layers * static_cast<size_t>(seq_len) * (k_bytes + v_bytes);
         }
     }
 };

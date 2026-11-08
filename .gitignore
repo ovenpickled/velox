@@ -33,3 +33,9 @@ build/
 scripts/__pycache__/
 roofline_bench
 *.bin
+
+# gguf
+gguf/
+
+# data
+data/

@@ -354,6 +354,33 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
         return (v && std::string(v) == "2") ? 2 : 0;
     }();
     static const bool dbg_on = std::getenv("VELOX_DEBUG_ACT") != nullptr;
+    // Diagnostic: VELOX_KV_FAKEQ=k|v|kv quantizes then dequantizes K and/or V (symmetric INT8, scale per
+    // VELOX_KV_GROUP elements; default = head_dim) before they are stored in the FP32 cache. Isolates the
+    // numerical error of KV quantization (which tensor, which group size) without touching the INT8 layout.
+    static const std::string fq_mode = [] { const char* v = std::getenv("VELOX_KV_FAKEQ"); return std::string(v ? v : ""); }();
+    static const int fq_group = [this] {
+        const char* v = std::getenv("VELOX_KV_GROUP");
+        int g = v ? std::atoi(v) : config_.head_dim;
+        if (g <= 0 || config_.head_dim % g != 0) {
+            std::cerr << "[diag] VELOX_KV_GROUP must divide head_dim (" << config_.head_dim << "); using head_dim" << std::endl;
+            g = config_.head_dim;
+        }
+        return g;
+    }();
+    static const bool fq_k = fq_mode == "k" || fq_mode == "kv";
+    static const bool fq_v = fq_mode == "v" || fq_mode == "kv";
+    static const bool fq_announce = [] { if (fq_k || fq_v) std::cerr << "[diag] KV fake-quant: mode=" << fq_mode << " group=" << fq_group << std::endl; return true; }();
+    (void)fq_announce;
+    auto fakeq = [](float* x, int n, int group) {
+        for (int g0 = 0; g0 < n; g0 += group) {
+            float mx = 0.0f;
+            for (int i = g0; i < g0 + group; i++) mx = std::max(mx, std::fabs(x[i]));
+            const float sc = mx / 127.0f;
+            const float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+            for (int i = g0; i < g0 + group; i++)
+                x[i] = std::round(std::max(-127.0f, std::min(127.0f, x[i] * inv))) * sc;
+        }
+    };
 
     // Per-component accumulators for detailed profiling (VELOX_PROF=2)
     using DurMS = std::chrono::duration<double, std::milli>;
@@ -502,6 +529,15 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                            v_buf_.data() + b * max_len * kv_dim,
                            actual_lens[b] * kv_dim * sizeof(float));
             }
+            if (fq_k || fq_v) {
+                for (int b = 0; b < batch_size; b++) {
+                    for (int p = 0; p < actual_lens[b]; p++) {
+                        const int slot = past_lens[b] + p;
+                        if (fq_k) fakeq(kv_caches_[b].k_cache[layer].data() + slot * kv_dim, kv_dim, fq_group);
+                        if (fq_v) fakeq(kv_caches_[b].v_cache[layer].data() + slot * kv_dim, kv_dim, fq_group);
+                    }
+                }
+            }
         } else {
             for (int b = 0; b < batch_size; b++) {
                 int8_t* k_cache_i8 = kv_caches_[b].k_cache_i8[layer].data();
@@ -518,16 +554,21 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                         const float* kh_src = k_src + kv_h * head_dim;
                         const float* vh_src = v_src + kv_h * head_dim;
 
-                        // Quantize Key head
-                        float max_k = 0.0f;
-                        for (int d = 0; d < head_dim; d++) max_k = std::max(max_k, std::abs(kh_src[d]));
-                        float scale_k = max_k / 127.0f;
-                        k_scales[slot * num_kv_heads + kv_h] = scale_k;
-                        float inv_k = (scale_k > 0.0f) ? (1.0f / scale_k) : 0.0f;
+                        // Quantize Key head: one scale per KV_K_GROUP values
+                        const int kgph = kv_caches_[b].k_groups_per_head;
+                        const int kgs = head_dim / kgph;
                         int8_t* kh_dst = k_cache_i8 + slot * kv_dim + kv_h * head_dim;
-                        for (int d = 0; d < head_dim; d++) {
-                            float s = kh_src[d] * inv_k;
-                            kh_dst[d] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, s))));
+                        for (int g = 0; g < kgph; g++) {
+                            const float* gsrc = kh_src + g * kgs;
+                            float max_k = 0.0f;
+                            for (int d = 0; d < kgs; d++) max_k = std::max(max_k, std::abs(gsrc[d]));
+                            float scale_k = max_k / 127.0f;
+                            k_scales[(static_cast<size_t>(slot) * num_kv_heads + kv_h) * kgph + g] = scale_k;
+                            float inv_k = (scale_k > 0.0f) ? (1.0f / scale_k) : 0.0f;
+                            for (int d = 0; d < kgs; d++) {
+                                float sq = gsrc[d] * inv_k;
+                                kh_dst[g * kgs + d] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, sq))));
+                            }
                         }
 
                         // Quantize Value head
@@ -602,6 +643,8 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                     const float* k_scales = kv_caches_[b].k_scales[layer].data();
                     const int8_t* v_cache_i8 = kv_caches_[b].v_cache_i8[layer].data();
                     const float* v_scales = kv_caches_[b].v_scales[layer].data();
+                    const int kgph = kv_caches_[b].k_groups_per_head;
+                    const int kgs = head_dim / kgph;
 
                     for (int qp = 0; qp < al; qp++) {
                         int gp = b * max_len + qp;
@@ -615,13 +658,32 @@ void Qwen2Model::forward_batch(const std::vector<std::vector<int>>& batch_tokens
                                 scores[kp] = -INFINITY;
                             } else {
                                 const int8_t* k_ptr = k_cache_i8 + kp * kv_dim + kv_h * head_dim;
-                                float k_s = k_scales[kp * num_kv_heads + kv_h];
+                                const float* ks = k_scales + (static_cast<size_t>(kp) * num_kv_heads + kv_h) * kgph;
                                 float dot = 0.0f;
-                                #pragma omp simd reduction(+:dot)
-                                for (int d = 0; d < head_dim; d++) {
-                                    dot += q_ptr[d] * static_cast<float>(k_ptr[d]);
+                                if (kgph == 2 && head_dim == 64) {
+                                    // Fast path (Qwen2.5-0.5B: head_dim 64, two 32-value key groups).
+                                    // Both halves are scaled and accumulated lane-wise, so only ONE horizontal
+                                    // reduction is needed per key instead of one per group (microbenchmark:
+                                    // ~2x faster than the old per-head loop, ~3x faster than per-group reductions).
+                                    float lane[32];
+                                    const float s0 = ks[0], s1 = ks[1];
+                                    for (int d = 0; d < 32; d++) {
+                                        lane[d] = s0 * q_ptr[d] * static_cast<float>(k_ptr[d])
+                                                + s1 * q_ptr[d + 32] * static_cast<float>(k_ptr[d + 32]);
+                                    }
+                                    #pragma omp simd reduction(+:dot)
+                                    for (int d = 0; d < 32; d++) dot += lane[d];
+                                } else {
+                                    for (int g = 0; g < kgph; g++) {   // generic path for other head sizes
+                                        float gdot = 0.0f;
+                                        #pragma omp simd reduction(+:gdot)
+                                        for (int d = g * kgs; d < (g + 1) * kgs; d++) {
+                                            gdot += q_ptr[d] * static_cast<float>(k_ptr[d]);
+                                        }
+                                        dot += gdot * ks[g];
+                                    }
                                 }
-                                scores[kp] = (dot * k_s) * scale;
+                                scores[kp] = dot * scale;
                             }
                         }
                         ops::softmax(scores, tl);

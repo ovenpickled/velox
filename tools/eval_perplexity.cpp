@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
+#include <stdexcept>
 #include "model.hpp"
 #include "tokenizer.hpp"
 
@@ -37,6 +38,8 @@ struct EvalResult {
     size_t kv_active_bytes = 0;
     double kv_traffic_mb_per_tok = 0.0;
     double kv_bandwidth_gb_s = 0.0;
+    size_t target_bytes = 0;      // UTF-8 bytes of the scored target tokens
+    double bits_per_byte = 0.0;   // tokenizer-independent quality metric
 };
 
 // Computes Negative Log Likelihood (NLL) of target_token given logits
@@ -54,9 +57,13 @@ static double compute_nll(const float* logits, int vocab_size, int target_token)
     return lse - static_cast<double>(logits[target_token]);
 }
 
-static EvalResult evaluate_sequence(Qwen2Model& model, const std::vector<int>& tokens, int max_tokens, bool verbose = true) {
+static EvalResult evaluate_sequence(Qwen2Model& model, const Tokenizer& tok, const std::vector<int>& all_tokens,
+                                    size_t offset, int max_tokens, bool verbose = true) {
     EvalResult res;
-    int n = std::min(static_cast<int>(tokens.size()), max_tokens + 1);
+    // Window = all_tokens[offset, offset + max_tokens]: max_tokens scored targets + 1 leading context token
+    std::vector<int> tokens(all_tokens.begin() + offset,
+                            all_tokens.begin() + std::min(all_tokens.size(), offset + static_cast<size_t>(max_tokens) + 1));
+    int n = static_cast<int>(tokens.size());
     if (n < 2) {
         std::cerr << "Not enough tokens to evaluate (need at least 2 tokens, got " << n << ")" << std::endl;
         return res;
@@ -81,6 +88,7 @@ static EvalResult evaluate_sequence(Qwen2Model& model, const std::vector<int>& t
         double nll = compute_nll(logits.data(), vocab_size, target_token);
         total_nll += nll;
         scored_tokens++;
+        res.target_bytes += tok.decode(target_token).size();
 
         if (verbose && ((scored_tokens % 64 == 0) || (scored_tokens == n - 1))) {
             double cur_loss = total_nll / scored_tokens;
@@ -106,18 +114,19 @@ static EvalResult evaluate_sequence(Qwen2Model& model, const std::vector<int>& t
     res.total_nll = total_nll;
     res.mean_loss = total_nll / scored_tokens;
     res.perplexity = std::exp(res.mean_loss);
+    res.bits_per_byte = (res.target_bytes > 0) ? total_nll / std::log(2.0) / res.target_bytes : 0.0;
     res.tokens_per_sec = (res.elapsed_seconds > 0.0) ? (scored_tokens / res.elapsed_seconds) : 0.0;
     res.kv_memory_bytes = model.kv_cache_memory_bytes();
     res.kv_active_bytes = model.kv_cache_active_bytes();
 
     // KV traffic calculation:
     // Average KV cache length during generation is ~ n / 2
-    // Bytes per token per layer: FP32 = 1024 B, INT8 = 272 B
+    // Bytes per token per layer: FP32 = 1024 B, INT8 = 280 B (K: one scale per 32 values, V: one per head)
     const ModelConfig& cfg = model.config();
     int kv_dim = cfg.num_key_value_heads * cfg.head_dim;
     size_t bytes_per_pos_per_layer = (model.kv_type() == KVType::FP32)
         ? (kv_dim * sizeof(float) * 2)
-        : (kv_dim * sizeof(int8_t) * 2 + cfg.num_key_value_heads * sizeof(float) * 2);
+        : (kv_dim * sizeof(int8_t) * 2 + cfg.num_key_value_heads * sizeof(float) * (1 + ((cfg.head_dim % KVCache::KV_K_GROUP == 0) ? cfg.head_dim / KVCache::KV_K_GROUP : 1)));
     size_t bytes_per_pos_all_layers = bytes_per_pos_per_layer * cfg.num_hidden_layers;
 
     double avg_context = (scored_tokens) / 2.0;
@@ -127,128 +136,86 @@ static EvalResult evaluate_sequence(Qwen2Model& model, const std::vector<int>& t
     return res;
 }
 
-// Long-context benchmark measuring at exact target context depths (1024, 2048, 4096 tokens)
+// Long-context KV-cache benchmark at exact context depths (1024, 2048, 4096 tokens).
+// Both models stay loaded; runs alternate FP32/INT8 for each repeat so thermal drift and
+// background load hit both equally. Reports the median decode speed and the min-max range.
 static void run_long_context_benchmark(const std::string& model_dir, const std::vector<int>& tokens) {
     std::cout << "\n================================================================================" << std::endl;
     std::cout << "TASK 3: INT8 KV-CACHE LONG-CONTEXT BENCHMARK (1K, 2K, 4K TOKENS)" << std::endl;
     std::cout << "================================================================================" << std::endl;
 
-    std::vector<int> target_contexts = {1024, 2048, 4096};
-    const int num_decode_steps = 32; // decode steps measured at context depth
+    if (const char* e = std::getenv("VELOX_KV_INT8")) {
+        if (std::string(e) == "1" || std::string(e) == "true")
+            throw std::runtime_error("unset VELOX_KV_INT8: it would force the FP32 run to use an INT8 cache");
+    }
 
-    std::cout << "Benchmarking KV traffic, memory, and decode latency at context depths: 1k, 2k, 4k...\n" << std::endl;
+    const std::vector<int> target_contexts = {1024, 2048, 4096};
+    const int num_decode_steps = 128;   // timed decode steps at each depth
+    const int repeats = 3;
+    const int prefill_chunk = 512;
 
-    struct ContextResult {
-        int context = 0;
-        double fp32_speed = 0.0;
-        double int8_speed = 0.0;
-        double fp32_mem_mb = 0.0;
-        double int8_mem_mb = 0.0;
-        double fp32_traffic_mb = 0.0;
-        double int8_traffic_mb = 0.0;
-        double fp32_ppl = 0.0;
-        double int8_ppl = 0.0;
+    Qwen2Model models[2];
+    const KVType types[2] = {KVType::FP32, KVType::INT8};
+    const char* names[2] = {"FP32", "INT8"};
+    for (int i = 0; i < 2; i++) {
+        if (!models[i].load(model_dir, 1, types[i]))
+            throw std::runtime_error(std::string("failed to load model (") + names[i] + " KV run)");
+    }
+    std::vector<float> logits(models[0].config().vocab_size);
+
+    // Prefill `ctx` tokens, then time `num_decode_steps` single-token decode steps. Returns tok/s.
+    auto run_once = [&](Qwen2Model& model, int ctx) {
+        model.reset();
+        for (int s = 0; s < ctx; s += prefill_chunk) {
+            int end_s = std::min(s + prefill_chunk, ctx);
+            std::vector<int> chunk(tokens.begin() + s, tokens.begin() + end_s);
+            model.forward(chunk, logits.data());
+        }
+        auto t0 = high_resolution_clock::now();
+        for (int s = 0; s < num_decode_steps; s++) model.forward({tokens[ctx + s]}, logits.data());
+        auto t1 = high_resolution_clock::now();
+        return num_decode_steps / (duration_cast<microseconds>(t1 - t0).count() / 1e6);
     };
-    std::vector<ContextResult> results;
+
+    struct Row { int ctx; double mem_mb[2]; double med[2], lo[2], hi[2]; };
+    std::vector<Row> rows;
 
     for (int ctx : target_contexts) {
         if (static_cast<int>(tokens.size()) < ctx + num_decode_steps) {
             std::cout << "[SKIP] Not enough tokens for context " << ctx << std::endl;
             continue;
         }
-
-        ContextResult cr;
-        cr.context = ctx;
-
-        std::cout << ">>> Context depth: " << ctx << " tokens (" << num_decode_steps << " decode steps)" << std::endl;
-
-        // Run FP32 KV Cache
-        {
-            std::cout << "  [Running FP32 KV Cache]..." << std::flush;
-            Qwen2Model model_fp32;
-            model_fp32.load(model_dir, 1, KVType::FP32);
-            std::vector<float> logits(model_fp32.config().vocab_size);
-
-            // Chunked prefill up to ctx (chunks of 512 for cache locality)
-            const int prefill_chunk = 512;
-            for (int s = 0; s < ctx; s += prefill_chunk) {
-                int end_s = std::min(s + prefill_chunk, ctx);
-                std::vector<int> chunk(tokens.begin() + s, tokens.begin() + end_s);
-                model_fp32.forward(chunk, logits.data());
+        std::cout << ">>> Context depth " << ctx << ": " << repeats << " repeats x " << num_decode_steps << " decode steps" << std::endl;
+        std::vector<double> speeds[2];
+        for (int r = 0; r < repeats; r++) {
+            for (int i = 0; i < 2; i++) {   // alternate FP32, INT8, FP32, INT8, ...
+                double v = run_once(models[i], ctx);
+                speeds[i].push_back(v);
+                std::cout << "  repeat " << (r + 1) << "  " << names[i] << " KV: " << std::fixed << std::setprecision(2) << v << " tok/s" << std::endl;
             }
-
-            // Measure decode of next num_decode_steps tokens
-            double nll_sum = 0.0;
-            auto t0 = high_resolution_clock::now();
-            for (int s = 0; s < num_decode_steps; s++) {
-                int tok = tokens[ctx + s];
-                int target = tokens[ctx + s + 1];
-                model_fp32.forward({tok}, logits.data());
-                nll_sum += compute_nll(logits.data(), model_fp32.config().vocab_size, target);
-            }
-            auto t1 = high_resolution_clock::now();
-            double secs = duration_cast<milliseconds>(t1 - t0).count() / 1000.0;
-
-            cr.fp32_speed = num_decode_steps / secs;
-            cr.fp32_mem_mb = model_fp32.kv_cache_active_bytes() / (1024.0 * 1024.0);
-            cr.fp32_traffic_mb = (ctx * 24 * 1024.0) / (1024.0 * 1024.0); // 24 KB per token
-            cr.fp32_ppl = std::exp(nll_sum / num_decode_steps);
-            std::cout << " Speed: " << cr.fp32_speed << " tok/s | Memory: " << cr.fp32_mem_mb << " MB | PPL: " << cr.fp32_ppl << std::endl;
         }
-
-        // Run INT8 KV Cache
-        {
-            std::cout << "  [Running INT8 KV Cache]..." << std::flush;
-            Qwen2Model model_int8;
-            model_int8.load(model_dir, 1, KVType::INT8);
-            std::vector<float> logits(model_int8.config().vocab_size);
-
-            // Chunked prefill up to ctx (chunks of 512 for cache locality)
-            const int prefill_chunk = 512;
-            for (int s = 0; s < ctx; s += prefill_chunk) {
-                int end_s = std::min(s + prefill_chunk, ctx);
-                std::vector<int> chunk(tokens.begin() + s, tokens.begin() + end_s);
-                model_int8.forward(chunk, logits.data());
-            }
-
-            // Measure decode of next num_decode_steps tokens
-            double nll_sum = 0.0;
-            auto t0 = high_resolution_clock::now();
-            for (int s = 0; s < num_decode_steps; s++) {
-                int tok = tokens[ctx + s];
-                int target = tokens[ctx + s + 1];
-                model_int8.forward({tok}, logits.data());
-                nll_sum += compute_nll(logits.data(), model_int8.config().vocab_size, target);
-            }
-            auto t1 = high_resolution_clock::now();
-            double secs = duration_cast<milliseconds>(t1 - t0).count() / 1000.0;
-
-            cr.int8_speed = num_decode_steps / secs;
-            cr.int8_mem_mb = model_int8.kv_cache_active_bytes() / (1024.0 * 1024.0);
-            cr.int8_traffic_mb = (ctx * 24 * 272.0) / (1024.0 * 1024.0); // 6.375 KB per token
-            cr.int8_ppl = std::exp(nll_sum / num_decode_steps);
-            std::cout << " Speed: " << cr.int8_speed << " tok/s | Memory: " << cr.int8_mem_mb << " MB | PPL: " << cr.int8_ppl << std::endl;
+        Row row{};
+        row.ctx = ctx;
+        for (int i = 0; i < 2; i++) {
+            std::sort(speeds[i].begin(), speeds[i].end());
+            row.med[i] = speeds[i][speeds[i].size() / 2];
+            row.lo[i] = speeds[i].front();
+            row.hi[i] = speeds[i].back();
+            row.mem_mb[i] = models[i].kv_cache_active_bytes() / (1024.0 * 1024.0);   // analytic: from the cache layout
         }
-
-        results.push_back(cr);
+        rows.push_back(row);
     }
 
-    // Print benchmark comparison table
-    std::cout << "\n### Long Context (1k, 2k, 4k) KV-Cache Comparison Table\n" << std::endl;
-    std::cout << "| Context Depth | FP32 Mem (MB) | INT8 Mem (MB) | Memory Saving | FP32 Traffic (MB/tok) | INT8 Traffic (MB/tok) | Traffic Reduction | FP32 Speed (tok/s) | INT8 Speed (tok/s) | Speedup | PPL Delta |" << std::endl;
-    std::cout << "|:-------------:|:-------------:|:-------------:|:-------------:|:---------------------:|:---------------------:|:-----------------:|:------------------:|:------------------:|:-------:|:---------:|" << std::endl;
-
-    for (const auto& r : results) {
-        double mem_saving = (1.0 - r.int8_mem_mb / r.fp32_mem_mb) * 100.0;
-        double traffic_reduction = r.fp32_traffic_mb / r.int8_traffic_mb;
-        double speedup = r.int8_speed / r.fp32_speed;
-        double ppl_diff = ((r.int8_ppl - r.fp32_ppl) / r.fp32_ppl) * 100.0;
-
-        printf("| %13d | %13.2f | %13.2f | %12.1f%% | %21.2f | %21.2f | %16.2fx | %18.2f | %18.2f | %6.2fx | %+8.3f%% |\n",
-               r.context, r.fp32_mem_mb, r.int8_mem_mb, mem_saving,
-               r.fp32_traffic_mb, r.int8_traffic_mb, traffic_reduction,
-               r.fp32_speed, r.int8_speed, speedup, ppl_diff);
+    std::cout << "\n### Long-context KV-cache comparison (INT8 weights; median of " << repeats << " runs, range in brackets)\n" << std::endl;
+    std::cout << "| Context | FP32 KV mem (MB) | INT8 KV mem (MB) | Memory saving | FP32 KV tok/s | INT8 KV tok/s | INT8 / FP32 speed |" << std::endl;
+    std::cout << "|:-------:|-----------------:|-----------------:|--------------:|:-------------:|:-------------:|------------------:|" << std::endl;
+    for (const auto& r : rows) {
+        printf("| %7d | %16.2f | %16.2f | %12.1f%% | %5.2f [%5.2f-%5.2f] | %5.2f [%5.2f-%5.2f] | %16.2fx |\n",
+               r.ctx, r.mem_mb[0], r.mem_mb[1], (1.0 - r.mem_mb[1] / r.mem_mb[0]) * 100.0,
+               r.med[0], r.lo[0], r.hi[0], r.med[1], r.lo[1], r.hi[1], r.med[1] / r.med[0]);
     }
+    std::cout << "Memory is computed from the cache layout (analytic), not measured. If the ranges overlap, the speed difference is within noise." << std::endl;
+    std::cout << "For quality, use scripts/run_eval.py (4096 scored tokens); a 128-token PPL here would be too noisy to mean anything." << std::endl;
     std::cout << "================================================================================" << std::endl;
 }
 
@@ -259,6 +226,7 @@ int main(int argc, char* argv[]) {
         int max_tokens = 1024;
         bool fp32 = false;
         bool bench_kv = false;
+        int num_windows = 1;
         KVType kv_type = KVType::FP32;
 
         for (int i = 1; i < argc; i++) {
@@ -270,6 +238,7 @@ int main(int argc, char* argv[]) {
             if (arg == "--model") model_dir = value();
             else if (arg == "--file") file_path = value();
             else if (arg == "--max-tokens") max_tokens = parse_int(arg, value());
+            else if (arg == "--num-windows") num_windows = parse_int(arg, value());
             else if (arg == "--fp32") fp32 = true;
             else if (arg == "--benchmark-kv") bench_kv = true;
             else if (arg == "--kv-cache-type") {
@@ -335,19 +304,50 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "Starting evaluation...\n" << std::endl;
-        EvalResult res = evaluate_sequence(model, tokens, max_tokens, true);
+        if (num_windows < 1) throw std::invalid_argument("--num-windows must be >= 1");
+        EvalResult res;
+        double sum_elapsed = 0.0;
+        int windows_done = 0;
+        for (int w = 0; w < num_windows; w++) {
+            size_t offset = static_cast<size_t>(w) * max_tokens;   // consecutive, non-overlapping windows
+            if (offset + 2 > tokens.size()) { std::cerr << "Only " << w << " full window(s) available in the input" << std::endl; break; }
+            EvalResult r = evaluate_sequence(model, tokenizer, tokens, offset, max_tokens, true);
+            if (r.num_tokens == 0) break;
+            res.num_tokens += r.num_tokens;
+            res.total_nll += r.total_nll;
+            res.target_bytes += r.target_bytes;
+            sum_elapsed += r.elapsed_seconds;
+            res.kv_memory_bytes = std::max(res.kv_memory_bytes, r.kv_memory_bytes);
+            res.kv_active_bytes = std::max(res.kv_active_bytes, r.kv_active_bytes);
+            res.kv_traffic_mb_per_tok = r.kv_traffic_mb_per_tok;
+            res.kv_bandwidth_gb_s = r.kv_bandwidth_gb_s;
+            windows_done++;
+        }
+        if (res.num_tokens == 0) { std::cerr << "Nothing was evaluated" << std::endl; return 1; }
+        res.mean_loss = res.total_nll / res.num_tokens;
+        res.perplexity = std::exp(res.mean_loss);
+        res.bits_per_byte = res.total_nll / std::log(2.0) / res.target_bytes;
+        res.elapsed_seconds = sum_elapsed;
+        res.tokens_per_sec = res.num_tokens / sum_elapsed;
 
         std::cout << "\n================================================================================" << std::endl;
         std::cout << "EVALUATION RESULTS:" << std::endl;
+        std::cout << "  Windows:             " << windows_done << " x " << max_tokens << " tokens" << std::endl;
         std::cout << "  Tokens Evaluated:    " << res.num_tokens << std::endl;
         std::cout << "  Cross-Entropy Loss:  " << std::fixed << std::setprecision(4) << res.mean_loss << std::endl;
         std::cout << "  Perplexity (PPL):    " << std::fixed << std::setprecision(4) << res.perplexity << std::endl;
+        std::cout << "  Bits per byte:       " << std::fixed << std::setprecision(4) << res.bits_per_byte << "  (comparable across languages)" << std::endl;
         std::cout << "  Evaluation Speed:    " << std::fixed << std::setprecision(2) << res.tokens_per_sec << " tokens/sec" << std::endl;
         std::cout << "  Elapsed Time:        " << std::fixed << std::setprecision(2) << res.elapsed_seconds << " seconds" << std::endl;
         std::cout << "  KV Cache Active Mem: " << std::fixed << std::setprecision(2) << res.kv_active_bytes / (1024.0 * 1024.0) << " MB" << std::endl;
         std::cout << "  Avg KV Cache Traffic:" << std::fixed << std::setprecision(2) << res.kv_traffic_mb_per_tok << " MB / token" << std::endl;
         std::cout << "  Avg KV Bandwidth:    " << std::fixed << std::setprecision(2) << res.kv_bandwidth_gb_s << " GB / sec" << std::endl;
         std::cout << "================================================================================" << std::endl;
+        // One machine-readable line for scripts/run_eval.py
+        std::cout << "RESULT_JSON {\"weights\":\"" << (fp32 ? "fp32" : "int8") << "\",\"kv\":\""
+                  << (kv_type == KVType::INT8 ? "int8" : "fp32") << "\",\"tokens\":" << res.num_tokens
+                  << ",\"ppl\":" << std::setprecision(6) << res.perplexity << ",\"loss\":" << res.mean_loss
+                  << ",\"bpb\":" << res.bits_per_byte << ",\"tok_s\":" << res.tokens_per_sec << "}" << std::endl;
 
         return 0;
     } catch (const std::exception& e) {

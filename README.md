@@ -14,6 +14,7 @@ See ['RESULTS.md'](RESULTS.md) for the optimization write-up.
 - **Output-dimension parallel matmuls** - [`ops::matmul_w8a8`](src/ops.cpp) parallelizes over the output dimension `N` with the batch rows in the inner loop, so every weight row is streamed from memory once and reused for all sequences in the batch. (Parallelizing over the batch dimension left almost every core idle during decode.)
 - **Conditional OpenMP parallelization** - attention loops use [`#pragma omp parallel for collapse(2)`](https://www.openmp.org/spec-html/5.0/openmpsu41.html), but only when `batch_size * num_heads` is large enough to justify thread spin-up. Small single-sequence workloads run single-threaded to avoid overhead.
 - **BF16 to FP32 conversion via bit manipulation** - [`SafetensorsFile::bf16_to_float`](src/safetensors.cpp) reconstructs a float from a bfloat16 value by shifting its bits into the upper 16 bits of a 32-bit float, since BF16 is just a truncated FP32.
+- **Optional INT8 KV cache** - `--kv-cache-type int8` stores keys and values as INT8 with float scales (keys: one scale per 32 values, values: one per head), cutting cache memory by 72.7% (99 MB to 27 MB at 4096 tokens for Qwen2.5-0.5B). Queries stay in FP32, so attention reads INT8 keys and values and rescales. See [Evaluation](#evaluation) for the quality and speed cost.
 - **Byte-level BPE tokenizer without regex** - [`tokenizer.cpp`](src/tokenizer.cpp) implements Qwen2's pre-tokenizer split rules by hand (single digits, optional leading punctuation, Unicode letters and numbers via the generated tables in [`unicode_tables.hpp`](include/unicode_tables.hpp)) instead of using a regex engine, and maps special tokens such as `<|im_start|>` to their ids. It was fuzz-tested against the reference regex; check it against your own `tokenizer.json` with [`scripts/check_tokenizer.py`](scripts/check_tokenizer.py).
 - **Non-owning tensor views** - [`Tensor::view`](include/tensor.hpp) and [`Tensor::row`](include/tensor.hpp) reinterpret existing memory with a new shape instead of copying data, similar to how NumPy views work.
 - **Load-time protection of outlier-sensitive matrices** - the first token of every sequence carries "massive activations" (|x| ~ 1000 on a few channels). INT8 weights cannot represent products with such values, which broke single-token prompts. At load time the engine runs one calibration token, finds the MLP matrices whose input exceeds 100 at that position, and keeps just those in FP32 (on Qwen2.5-0.5B: layer 2's down projection and layers 3 and 21's gate/up/down, about 122 MB in FP32). Disable with `VELOX_NO_AUTO_FP32=1`.
@@ -48,13 +49,18 @@ See ['RESULTS.md'](RESULTS.md) for the optimization write-up.
   - [`verify.py`](scripts/verify.py) writes reference logits for a prompt.
   - [`compare.py`](scripts/compare.py) compares engine logits (written with `VELOX_DUMP_LOGITS`) against that reference: mean and max difference, top-1 match and top-10 overlap.
   - [`check_tokenizer.py`](scripts/check_tokenizer.py) compares the engine's token ids (via `--tokenize-only`) against Hugging Face's on a set of tricky strings.
-- ['tools/'](docs/) - holds ['roofline_bench.cpp'](tools/roofline_bench.cpp) (bandwidth and compute ceilings) and ['roofline_vec_test.cpp'](tools/roofline_vec_test.cpp) (kernel bandwidth check).
+  - [`test_unicode_tokenizer.py`](scripts/test_unicode_tokenizer.py) runs 74 Unicode-heavy strings (kana, kanji, half/full-width forms, rare kanji, emoji, special tokens) against Hugging Face, then measures tokens per character on an English and a Japanese corpus.
+  - [`prep_data.py`](scripts/prep_data.py) writes NFC-normalised copies of the evaluation corpora.
+  - [`run_eval.py`](scripts/run_eval.py) runs the perplexity matrix (English/Japanese x FP32/INT8 weights x FP32/INT8 KV cache).
+  - [`kv_ablation.sh`](scripts/kv_ablation.sh) isolates which part of KV quantization costs perplexity (K only, V only, scale group size).
+  - [`llama_baseline.sh`](scripts/llama_baseline.sh) runs llama.cpp (F16 and Q8_0) on the same text and machine.
+- [`tools/`](tools/) - holds [`roofline_bench.cpp`](tools/roofline_bench.cpp) (bandwidth and compute ceilings), [`roofline_vec_test.cpp`](tools/roofline_vec_test.cpp) (kernel bandwidth check) and [`eval_perplexity.cpp`](tools/eval_perplexity.cpp) (perplexity harness and long-context KV-cache benchmark).
 
 ## Build and run
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-./build/inference --model <model_dir> --prompt "Hello" --max-tokens 64 [--batch-size N] [--temperature T] [--greedy] [--benchmark]
+./build/inference --model <model_dir> --prompt "Hello" --max-tokens 64 [--batch-size N] [--temperature T] [--greedy] [--benchmark] [--kv-cache-type fp32|int8]
 ```
 
 `<model_dir>` needs `config.json`, `tokenizer.json` and `model.safetensors` (BF16, F16 or F32). `OMP_NUM_THREADS=4` is enough for batch 1; 6 helps at batch 8. The build expects `external/json.hpp` (nlohmann/json).
@@ -71,6 +77,8 @@ Environment variables (all off by default):
 - `VELOX_DEBUG_ACT=1` prints per-layer activation statistics for the prefill pass (max, mean, outlier ratio and channel).
 - `VELOX_NO_AUTO_FP32=1` turns off the load-time FP32 protection of outlier-sensitive matrices.
 - `VELOX_FP32_LAYERS=all` or a list like `2,3,21` keeps FP32 copies of those layers' weights and runs them in FP32. `VELOX_FP32_PROJ=q,k,v,o,gate,up,down` restricts that to the listed projections. `VELOX_FP32_LMHEAD=1` runs the LM head in FP32 (tied embeddings only).
+- `VELOX_KV_INT8=1` forces the INT8 KV cache (overrides `--kv-cache-type`; unset it when benchmarking the FP32 cache).
+- `VELOX_KV_FAKEQ=k|v|kv` with `VELOX_KV_GROUP=<n>` (a divisor of head_dim; default head_dim) quantizes and dequantizes keys and/or values before they enter the FP32 cache. A diagnostic for separating KV quantization error by tensor and scale granularity.
 - `VELOX_W8A32=1` runs the INT8-weight projections with FP32 activations, to separate weight-quantization error from activation-quantization error.
 
 ## Benchmarks
@@ -110,6 +118,36 @@ OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores ./roofline_bench
 
 Measured on this machine (raw output in [`docs/roofline.txt`](docs/roofline.txt)): read bandwidth peaks at 25.8 GB/s (median 23.9 GB/s at 4 threads; about 2 threads already saturate it), and the autovectorised INT8 kernel reaches 271 GOP/s at 4 threads and 460 GOP/s at 6 threads. Percentages below are relative to the peak bandwidth. Batch-1 decode streams about 22 GB/s of weights, roughly 87% of peak (94% of the median), so it is bandwidth-bound. Batch-8 decode reaches about 41% of its roof, so the INT8 kernel, not memory, is the limit there.
 
+## Evaluation
+
+Setup used for the numbers in [`RESULTS.md`](RESULTS.md): Qwen2.5-0.5B, Ryzen 5 220, `OMP_NUM_THREADS=6 OMP_PROC_BIND=close OMP_PLACES=cores`, English = WikiText-2 raw test, Japanese = a 293k-character Japanese text file. Data lives in `data/` (not in the repository).
+
+```bash
+export M=<model_dir> EN=data/wikitext-2-raw/wiki.test.raw JA=data/ja_test.raw
+unset VELOX_KV_INT8 VELOX_KV_FAKEQ VELOX_KV_GROUP
+
+# 1. Tokenizer vs Hugging Face (needs: pip install transformers), then tokens per character
+python scripts/prep_data.py $EN $JA                       # writes *.nfc
+python scripts/test_unicode_tokenizer.py --model $M --en $EN.nfc --ja $JA.nfc
+
+# 2. Perplexity matrix, 4 windows x 1024 tokens per cell (about 30 minutes)
+python scripts/run_eval.py --model $M --en $EN.nfc --ja $JA.nfc --tokens 1024 --windows 4
+
+# 3. llama.cpp baseline on the same text (needs a built llama.cpp; build only the three targets with -j2)
+LLAMA=~/llama.cpp bash scripts/llama_baseline.sh $M $EN.nfc 1024 4
+LLAMA=~/llama.cpp bash scripts/llama_baseline.sh $M $JA.nfc 1024 4
+
+# 4. INT8 KV cache: long-context speed and memory (1k, 2k, 4k), then the quantization ablation
+./build/eval_perplexity --model $M --file $EN.nfc --benchmark-kv
+bash scripts/kv_ablation.sh $M $EN.nfc
+```
+
+Notes on reading the results:
+- The perplexity tool scores every token after the first in each window. llama.cpp scores only the later part of each window, so absolute perplexities are not comparable between the two. Compare relative changes (INT8 versus FP32 within one engine).
+- Per-token perplexity is not comparable between English and Japanese because the tokenizer splits them very differently. The tool also prints bits per byte.
+- Windows are consecutive and non-overlapping from the start of the file, so four windows cover only the first 4096 tokens of each corpus.
+- The long-context benchmark alternates FP32 and INT8 runs, reports the median of three and the min-max range. Memory is computed from the cache layout, not measured.
+
 ## Known limitations
 
 - The batch-8 INT8 kernel reaches about 41% of its compute roof. A hand-written grouped kernel (VNNI intrinsics) is the obvious next step; the autovectoriser cannot produce one.
@@ -117,5 +155,7 @@ Measured on this machine (raw output in [`docs/roofline.txt`](docs/roofline.txt)
 - The embedding table is stored as FP32 (0.55 GB) alongside the INT8 LM head. Storing it as BF16 would halve it, exactly for BF16 checkpoints.
 - Load-time protection calibrates with a single token (id 0) and assumes the first-token massive-activation pattern; disable with `VELOX_NO_AUTO_FP32=1`.
 - Batching is static: sequences that finish early keep computing until the batch ends.
-- Context is limited to 4096 tokens.
-- The tokenizer matches Hugging Face on 25 test strings and a 100,000-string fuzz test against the reference regex (Unicode 15 tables); it has not been checked beyond that.
+- Context is limited to the smaller of the model's `max_position_embeddings` and 8192 tokens (4096 + 128 tokens was tested).
+- The INT8 KV cache saves memory but not time on this model (see `RESULTS.md`), and costs about 1.6% perplexity on English and 4.6% on Japanese; the Japanese cost is not explained yet.
+- Attention is the main cost of long-context decode (step time grows from 28.6 ms at 1k tokens to 43.9 ms at 4k, far more than the extra KV bandwidth explains) and has not been optimised.
+- The tokenizer matches Hugging Face on 25 test strings and a 100,000-string fuzz test against the reference regex (Unicode 15 tables); it has not been checked beyond that. A further check with 74 Unicode-heavy strings and with full English and Japanese corpora gives identical token ids. The one known gap: Hugging Face's Qwen tokenizer applies NFC normalisation and this one does not, so decomposed input (for example kana plus a separate dakuten) tokenizes differently; normalise text with `scripts/prep_data.py` first.
